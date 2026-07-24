@@ -839,6 +839,248 @@ def _build_graph_impl():
         }), 500
 
 
+@graph_bp.route('/append', methods=['POST'])
+def append_graph():
+    """Serialize append claims for the same project within this process."""
+
+    data = request.get_json(silent=True) or {}
+    project_id = data.get("project_id")
+    if not project_id:
+        return _append_graph_impl()
+    with _project_build_lock(project_id):
+        return _append_graph_impl()
+
+
+def _append_graph_impl():
+    """接口2b：向一个已构建完成的图谱追加新文本（不重建、不删旧）。
+
+    Add fresh documents (e.g. a new week's news) to a project's already-built
+    graph, reusing the graph's **frozen ontology**. Unlike /build, this never
+    creates a graph and never (re)sets the ontology, and it never deletes prior
+    data — it only ingests new episodes into the existing ``graph_id``. Zep's
+    bi-temporal model resolves/supersedes facts against what is already there,
+    so the graph grows over time instead of being rebuilt from scratch.
+
+    请求（JSON）：
+        {
+            "project_id": "proj_xxxx",  // 必填；项目状态须为 GRAPH_COMPLETED
+            "text": "....",             // 必填；要追加的新文档文本
+            "chunk_size": 500,          // 可选，默认取项目/全局配置
+            "chunk_overlap": 50         // 可选，默认取项目/全局配置
+        }
+
+    返回： { success, data: { project_id, task_id, graph_id, message } }
+    进度轮询： GET /api/graph/task/<task_id>
+
+    NOTE: appended text is ingested into the graph but is NOT written back to the
+    project's stored seed corpus, so a later force-rebuild (/build force=true)
+    rebuilds only from the original seed. Force-rebuild is a deliberate,
+    history-discarding exception; routine growth is append-only.
+    """
+    try:
+        errors = []
+        if not Config.ZEP_API_KEY:
+            errors.append(t('api.zepApiKeyMissing'))
+        if errors:
+            return jsonify({
+                "success": False,
+                "error": t('api.configError', details="; ".join(errors))
+            }), 500
+
+        data = request.get_json() or {}
+        project_id = data.get('project_id')
+        if not project_id:
+            return jsonify({
+                "success": False,
+                "error": t('api.requireProjectId')
+            }), 400
+
+        project = ProjectManager.get_project(project_id)
+        if not project:
+            return jsonify({
+                "success": False,
+                "error": t('api.projectNotFound', id=project_id)
+            }), 404
+
+        # A build already running for this project owns the graph; report it as
+        # busy rather than racing a second mutation.
+        if (
+            project.status == ProjectStatus.GRAPH_BUILDING
+            and _project_has_active_build(project)
+        ):
+            return jsonify({
+                "success": True,
+                "data": {
+                    "project_id": project_id,
+                    "task_id": project.graph_build_task_id,
+                    "graph_id": project.graph_id,
+                    "reused": True,
+                    "message": t('api.graphBuilding'),
+                }
+            })
+
+        # Append requires an existing, completed graph to add to.
+        if project.status != ProjectStatus.GRAPH_COMPLETED or not project.graph_id:
+            return jsonify({
+                "success": False,
+                "error": "Append requires an existing completed graph; build it first",
+            }), 409
+
+        text = data.get('text')
+        if not isinstance(text, str) or not text.strip():
+            return jsonify({
+                "success": False,
+                "error": "text (a non-empty string) is required"
+            }), 400
+
+        chunk_size = data.get('chunk_size', project.chunk_size or Config.DEFAULT_CHUNK_SIZE)
+        chunk_overlap = data.get('chunk_overlap', project.chunk_overlap or Config.DEFAULT_CHUNK_OVERLAP)
+        if not isinstance(chunk_size, int) or chunk_size <= 0:
+            return jsonify({"success": False, "error": "chunk_size must be a positive integer"}), 400
+        if (
+            not isinstance(chunk_overlap, int)
+            or chunk_overlap < 0
+            or chunk_overlap >= chunk_size
+        ):
+            return jsonify({
+                "success": False,
+                "error": "chunk_overlap must satisfy 0 <= chunk_overlap < chunk_size"
+            }), 400
+
+        graph_id = project.graph_id
+
+        task_manager = TaskManager()
+        task_id = task_manager.create_task(f"追加图谱: {project.name or graph_id}")
+        logger.info(
+            f"创建图谱追加任务: task_id={task_id}, project_id={project_id}, graph_id={graph_id}"
+        )
+
+        # Reuse the in-progress-build machinery so concurrent build/append/reset
+        # claims serialize through _project_has_active_build. The graph stays the
+        # same completed graph; status is restored to GRAPH_COMPLETED when done.
+        project.status = ProjectStatus.GRAPH_BUILDING
+        project.graph_build_task_id = task_id
+        ProjectManager.save_project(project)
+
+        current_locale = get_locale()
+
+        def append_task():
+            set_locale(current_locale)
+            build_logger = get_logger('mirofish.build')
+            try:
+                build_logger.info(f"[{task_id}] 开始追加图谱 graph_id={graph_id} ...")
+                task_manager.update_task(
+                    task_id,
+                    status=TaskStatus.PROCESSING,
+                    message="Appending new documents to existing graph",
+                    progress=5,
+                )
+
+                builder = GraphBuilderService(api_key=Config.ZEP_API_KEY)
+                chunks = TextProcessor.split_text(
+                    text, chunk_size=chunk_size, overlap=chunk_overlap
+                )
+                builder.validate_batch_chunks(chunks, batch_size=350)
+                total_chunks = len(chunks)
+
+                def add_progress_callback(msg, progress_ratio):
+                    task_manager.update_task(
+                        task_id, message=msg, progress=10 + int(progress_ratio * 45)  # 10-55%
+                    )
+
+                task_manager.update_task(
+                    task_id,
+                    message=f"Adding {total_chunks} new chunk(s) to graph {graph_id}",
+                    progress=10,
+                )
+                # No create_graph, no set_ontology: append into the existing
+                # graph under its already-set (frozen) ontology.
+                submission = builder.add_text_batches(
+                    graph_id,
+                    chunks,
+                    batch_size=350,
+                    progress_callback=add_progress_callback,
+                )
+
+                def wait_progress_callback(msg, progress_ratio):
+                    task_manager.update_task(
+                        task_id, message=msg, progress=55 + int(progress_ratio * 35)  # 55-90%
+                    )
+
+                task_manager.update_task(
+                    task_id, message=t('progress.waitingZepProcess'), progress=55
+                )
+                builder._wait_for_batch(submission, wait_progress_callback)
+
+                task_manager.update_task(
+                    task_id, message=t('progress.fetchingGraphData'), progress=95
+                )
+                graph_data = builder.get_graph_data(graph_id)
+                node_count = graph_data.get("node_count", 0)
+                edge_count = graph_data.get("edge_count", 0)
+                build_logger.info(
+                    f"[{task_id}] 图谱追加完成: graph_id={graph_id}, "
+                    f"节点={node_count}, 边={edge_count}, +chunks={total_chunks}"
+                )
+
+                with _project_build_lock(project_id):
+                    fresh = ProjectManager.get_project(project_id) or project
+                    fresh.status = ProjectStatus.GRAPH_COMPLETED
+                    fresh.error = None
+                    ProjectManager.save_project(fresh)
+                    task_manager.update_task(
+                        task_id,
+                        status=TaskStatus.COMPLETED,
+                        message="Graph append complete",
+                        progress=100,
+                        result={
+                            "project_id": project_id,
+                            "graph_id": graph_id,
+                            "node_count": node_count,
+                            "edge_count": edge_count,
+                            "appended_chunk_count": total_chunks,
+                            "zep_batch_id": submission.batch_id,
+                        },
+                    )
+
+            except Exception as e:
+                build_logger.error(f"[{task_id}] 图谱追加失败: {str(e)}")
+                build_logger.debug(traceback.format_exc())
+                with _project_build_lock(project_id):
+                    fresh = ProjectManager.get_project(project_id) or project
+                    # A failed append does not destroy the existing graph — leave
+                    # it usable by restoring COMPLETED (not FAILED).
+                    fresh.status = ProjectStatus.GRAPH_COMPLETED
+                    fresh.error = str(e)
+                    ProjectManager.save_project(fresh)
+                    task_manager.update_task(
+                        task_id,
+                        status=TaskStatus.FAILED,
+                        message=f"Append failed: {str(e)}",
+                        error=traceback.format_exc(),
+                    )
+
+        thread = threading.Thread(target=append_task, daemon=True)
+        thread.start()
+
+        return jsonify({
+            "success": True,
+            "data": {
+                "project_id": project_id,
+                "task_id": task_id,
+                "graph_id": graph_id,
+                "message": t('api.graphBuildStarted', taskId=task_id),
+            }
+        })
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
 # ============== 任务查询接口 ==============
 
 @graph_bp.route('/task/<task_id>', methods=['GET'])
