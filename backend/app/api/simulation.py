@@ -1889,8 +1889,12 @@ def get_run_status(simulation_id: str):
         }
     """
     try:
+        # Heartbeat for the dead-man's-switch: a live client polls this every few seconds
+        # while its sim runs, so this keeps the watchdog from reaping an actively-watched sim.
+        SimulationRunner.note_client_poll(simulation_id)
+
         run_state = SimulationRunner.get_run_state(simulation_id)
-        
+
         if not run_state:
             return jsonify({
                 "success": True,

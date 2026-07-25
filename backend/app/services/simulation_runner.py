@@ -238,6 +238,12 @@ class SimulationRunner:
     _finalization_locks_guard = threading.Lock()
     _manual_stop_requests: set[str] = set()
 
+    # Watchdog bookkeeping (monotonic seconds). _started tracks when a sim went RUNNING;
+    # _last_client_poll is refreshed by note_client_poll() on every run-status poll. The
+    # monitor thread reads both to enforce the dead-man's-switch (see _watchdog_reason).
+    _started_monotonic: Dict[str, float] = {}
+    _last_client_poll: Dict[str, float] = {}
+
     @classmethod
     def _finalization_lock(cls, simulation_id: str) -> threading.Lock:
         with cls._finalization_locks_guard:
@@ -296,7 +302,34 @@ class SimulationRunner:
         if state:
             cls._run_states[simulation_id] = state
         return state
-    
+
+    @classmethod
+    def note_client_poll(cls, simulation_id: str):
+        """Record a client's run-status poll — the heartbeat for the dead-man's-switch.
+
+        Only recorded for a sim we're actively tracking (RUNNING), so stray polls for
+        finished/unknown sims don't grow the map."""
+        if simulation_id in cls._started_monotonic:
+            cls._last_client_poll[simulation_id] = time.monotonic()
+
+    @staticmethod
+    def _watchdog_reason(now, started_monotonic, last_client_poll,
+                         max_duration, heartbeat_timeout):
+        """Return a stop reason if a running sim has outlived a safety bound, else None.
+
+        Pure and deterministic (no threads/clock/subprocess), so the policy is unit-tested
+        directly. A bound of 0 (or a missing timestamp) disables that check.
+        - ``no-client-heartbeat``: the client stopped polling run-status (it was killed / went
+          away) — MiroFish would otherwise keep the OASIS subprocess alive indefinitely.
+        - ``max-duration``: absolute ceiling, a backstop for a stuck-but-still-polled sim."""
+        if (heartbeat_timeout and last_client_poll is not None
+                and now - last_client_poll > heartbeat_timeout):
+            return "no-client-heartbeat"
+        if (max_duration and started_monotonic is not None
+                and now - started_monotonic > max_duration):
+            return "max-duration"
+        return None
+
     @classmethod
     def _load_run_state(cls, simulation_id: str) -> Optional[SimulationRunState]:
         """从文件加载运行状态"""
@@ -567,6 +600,11 @@ class SimulationRunner:
                 state.runner_status = RunnerStatus.RUNNING
                 cls._processes[simulation_id] = process
                 cls._monitor_threads[simulation_id] = monitor_thread
+                # Arm the watchdog: seed both clocks so a sim can't be reaped before its
+                # first client poll, and the absolute ceiling starts from RUNNING.
+                now = time.monotonic()
+                cls._started_monotonic[simulation_id] = now
+                cls._last_client_poll[simulation_id] = now
                 cls._save_run_state(state)
                 cls._sync_simulation_status(
                     simulation_id,
@@ -588,6 +626,8 @@ class SimulationRunner:
             cls._action_queues.pop(simulation_id, None)
             cls._stdout_files.pop(simulation_id, None)
             cls._stderr_files.pop(simulation_id, None)
+            cls._started_monotonic.pop(simulation_id, None)
+            cls._last_client_poll.pop(simulation_id, None)
             if main_log_file is not None:
                 try:
                     main_log_file.close()
@@ -653,6 +693,29 @@ class SimulationRunner:
                 
                 # 更新状态
                 cls._save_run_state(state)
+
+                # Dead-man's-switch: a killed/gone client can't /stop the sim, and MiroFish keeps
+                # the OASIS subprocess alive after its rounds — so bound its lifetime here. On a
+                # trip, reuse the manual-stop path (mark + terminate); the finally block below
+                # then finalizes it as STOPPED. Terminating the subprocess is what actually stops
+                # the CPU + LLM-token burn.
+                reason = cls._watchdog_reason(
+                    time.monotonic(),
+                    cls._started_monotonic.get(simulation_id),
+                    cls._last_client_poll.get(simulation_id),
+                    Config.SIM_MAX_DURATION_SECONDS,
+                    Config.SIM_CLIENT_HEARTBEAT_TIMEOUT_SECONDS,
+                )
+                if reason is not None:
+                    logger.warning(
+                        f"看门狗停止模拟 {simulation_id}: {reason} "
+                        f"(heartbeat={Config.SIM_CLIENT_HEARTBEAT_TIMEOUT_SECONDS}s, "
+                        f"max_duration={Config.SIM_MAX_DURATION_SECONDS}s)"
+                    )
+                    cls._manual_stop_requests.add(simulation_id)
+                    cls._terminate_process(process, simulation_id)
+                    break
+
                 time.sleep(2)
             
             # 进程结束后，最后读取一次日志
@@ -748,6 +811,8 @@ class SimulationRunner:
             cls._processes.pop(simulation_id, None)
             cls._action_queues.pop(simulation_id, None)
             cls._monitor_threads.pop(simulation_id, None)
+            cls._started_monotonic.pop(simulation_id, None)
+            cls._last_client_poll.pop(simulation_id, None)
             
             # 关闭日志文件句柄
             if simulation_id in cls._stdout_files:
