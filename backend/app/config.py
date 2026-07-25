@@ -43,6 +43,18 @@ class Config:
     
     # OASIS模拟配置
     OASIS_DEFAULT_MAX_ROUNDS = int(os.environ.get('OASIS_DEFAULT_MAX_ROUNDS', '10'))
+
+    # Simulation watchdog / dead-man's-switch. A running sim's OASIS subprocess outlives the
+    # HTTP request and is only stopped by the client's /stop call; if the client is killed
+    # (e.g. its session times out) it can never send /stop, and the subprocess keeps burning
+    # CPU + LLM tokens forever. These bound a running sim's lifetime server-side so that can't
+    # happen regardless of the client. Set either to 0 to disable that bound.
+    #   HEARTBEAT: max seconds with no client run-status poll before the sim is auto-stopped
+    #              (the client polls every few seconds while a sim runs, so a long gap == gone).
+    #   MAX_DURATION: absolute ceiling on a single sim, as a backstop for a stuck-but-polled run.
+    SIM_CLIENT_HEARTBEAT_TIMEOUT_SECONDS = int(
+        os.environ.get('SIM_CLIENT_HEARTBEAT_TIMEOUT_SECONDS', '300'))
+    SIM_MAX_DURATION_SECONDS = int(os.environ.get('SIM_MAX_DURATION_SECONDS', '5400'))
     OASIS_SIMULATION_DATA_DIR = os.path.join(os.path.dirname(__file__), '../uploads/simulations')
     
     # OASIS平台可用动作配置
