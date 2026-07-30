@@ -25,7 +25,13 @@ ZEP_CLOUD_BASE_URL = "https://api.getzep.com/api/v2"
 ZEP_HTTP_REQUEST_TIMEOUT_SECONDS = 60.0
 # Zep ingestion is asynchronous and may take several minutes. Preserve the
 # original GraphBuilder deadline while keeping it separate from HTTP timeout.
-ZEP_INGESTION_WAIT_TIMEOUT_SECONDS = 600
+# Overridable via env so a large cold-start ingest (e.g. a 60-90 day, many-name
+# cluster graph) can wait longer than the historical 600s default, which is a
+# poll-patience ceiling rather than a Zep-imposed limit — ingestion keeps running
+# regardless, we just stop waiting. Default preserves prior behaviour.
+ZEP_INGESTION_WAIT_TIMEOUT_SECONDS = int(
+    os.environ.get("ZEP_INGESTION_WAIT_TIMEOUT_SECONDS", "600")
+)
 MAX_ZEP_SEARCH_QUERY_CHARS = 400
 MAX_ZEP_SEARCH_RESULTS = 50
 
