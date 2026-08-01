@@ -26,6 +26,10 @@ dependencies = [
     # it made uv silently backtrack to an ancient 0.11.x. Pin to the 0.29 line the adapter targets.
     "graphiti-core>=0.29,<0.30",
     "falkordb>=1.1.2,<2.0.0",
+    # Pin redis-py < 8: falkordb 1.6.2's Is_Cluster() copies async-connection kwargs into a sync
+    # redis.Redis(**kwargs), and redis-py 8.x carries a kwarg (himport_registry) the sync client
+    # rejects -> TypeError at FalkorDriver init. redis-py 7.x is the client falkordb 1.6.2 targets.
+    "redis>=5,<8",
     # Free local embeddings (fastembed/ONNX, no key) so the backend runs on the existing OpenRouter
     # key alone — OpenRouter has no embeddings endpoint. Only needed for GRAPHITI_EMBEDDER=local.
     "fastembed>=0.3.0",
