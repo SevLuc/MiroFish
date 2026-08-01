@@ -65,6 +65,16 @@ READ_PAGE_SIZE = 500
 _RESERVED_ATTRS = {"uuid", "name", "group_id", "labels", "summary", "fact", "created_at",
                    "valid_at", "invalid_at", "expired_at", "attributes", "episodes"}
 
+#: Whether to extract custom per-entity/edge ATTRIBUTES (ticker, vendor, …) in addition to typed
+#: labels. Default OFF: graphiti's FalkorDB bulk-writer spreads each attribute as a raw node/edge
+#: property, and FalkorDB rejects any non-primitive value ("Property values can only be of primitive
+#: types or arrays of primitive types") — which an LLM-extracted attribute can be. With empty type
+#: models graphiti skips attribute extraction entirely (its own guard: a 0-field model returns {}),
+#: so typed LABELS + summaries + facts are kept and nothing nested reaches FalkorDB. Re-enable with
+#: GRAPHITI_EXTRACT_ATTRIBUTES=true once a param sanitizer (JSON-stringify nested values) is in place.
+def _extract_attributes_enabled() -> bool:
+    return (os.environ.get("GRAPHITI_EXTRACT_ATTRIBUTES") or "false").lower() in ("1", "true", "yes")
+
 
 def _pascal(name: str) -> str:
     # Split on spaces/underscores/hyphens so multi-word ontology names become a single valid
@@ -82,12 +92,17 @@ def _model_from_attributes(type_name: str, attributes: list[dict]) -> type[BaseM
     extractor fills what it can). A type with no attributes becomes a bare marker model.
     """
     fields: dict[str, Any] = {}
-    for attr in attributes or []:
-        key = str((attr or {}).get("name", "")).strip()
-        if not key or key in _RESERVED_ATTRS:
-            continue
-        desc = str((attr or {}).get("description", "") or "")
-        fields[key] = (Optional[str], Field(default=None, description=desc[:200]))
+    # Empty model (no fields) unless attribute extraction is explicitly enabled — see
+    # _EXTRACT_ATTRIBUTES: FalkorDB can't store the nested attribute values graphiti would spread
+    # onto nodes/edges. An empty model still carries the type NAME (used as the node label /
+    # edge-type), which is what MiroFish's persona filter needs.
+    if _extract_attributes_enabled():
+        for attr in attributes or []:
+            key = str((attr or {}).get("name", "")).strip()
+            if not key or key in _RESERVED_ATTRS:
+                continue
+            desc = str((attr or {}).get("description", "") or "")
+            fields[key] = (Optional[str], Field(default=None, description=desc[:200]))
     return create_model(_pascal(type_name), __base__=BaseModel, **fields)
 
 

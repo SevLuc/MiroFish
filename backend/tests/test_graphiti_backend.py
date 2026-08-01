@@ -23,12 +23,22 @@ def _onto():
     }
 
 
-def test_entity_types_are_pascal_cased_and_carry_their_attributes():
+def test_entity_types_are_pascal_cased_and_have_no_attributes_by_default():
+    # Default: type NAMES (labels) are produced, but models carry NO attribute fields — FalkorDB
+    # can't store the nested attribute values graphiti would spread onto nodes (see
+    # _extract_attributes_enabled). Typed labels are what MiroFish's persona filter needs.
     entity_types, _, _ = ontology_to_graphiti_types(_onto())
     assert set(entity_types) == {"SemiconductorCompany", "Person"}
-    # attributes become model fields...
+    assert list(entity_types["SemiconductorCompany"].model_fields) == []
+    assert list(entity_types["Person"].model_fields) == []
+
+
+def test_attributes_become_fields_when_explicitly_enabled(monkeypatch):
+    # Opt-in path (GRAPHITI_EXTRACT_ATTRIBUTES=true): attributes map to model fields, with
+    # graphiti-reserved names (summary/name/uuid/...) filtered out.
+    monkeypatch.setenv("GRAPHITI_EXTRACT_ATTRIBUTES", "true")
+    entity_types, _, _ = ontology_to_graphiti_types(_onto())
     assert "ticker" in entity_types["SemiconductorCompany"].model_fields
-    # ...but Graphiti-reserved names (summary/name/uuid/...) are filtered out
     assert "summary" not in entity_types["SemiconductorCompany"].model_fields
     assert list(entity_types["Person"].model_fields) == []
 
