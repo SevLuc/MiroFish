@@ -21,8 +21,11 @@ dependencies = [
     "httpx>=0.27.0",
 
     # Graphiti — self-hosted graph backend (GRAPH_BACKEND=graphiti, ADR 0009). Same engine Zep runs;
-    # drives a local FalkorDB. Pulls falkordb (the client) via the extra.
-    "graphiti-core[falkordb]>=0.3.0",
+    # drives a local FalkorDB. `falkordb` (the client) is declared directly rather than via the
+    # `[falkordb]` extra: the extra only exists on newer graphiti-core releases, and pinning through
+    # it made uv silently backtrack to an ancient 0.11.x. Pin to the 0.29 line the adapter targets.
+    "graphiti-core>=0.29,<0.30",
+    "falkordb>=1.1.2,<2.0.0",
     # Free local embeddings (fastembed/ONNX, no key) so the backend runs on the existing OpenRouter
     # key alone — OpenRouter has no embeddings endpoint. Only needed for GRAPHITI_EMBEDDER=local.
     "fastembed>=0.3.0",
@@ -48,6 +51,12 @@ dev = [
     "pytest-asyncio>=0.23.0",
     "pipreqs>=0.5.0",
 ]
+
+[tool.uv]
+# camel-oasis 0.2.5 hard-pins neo4j==5.23.0; graphiti-core 0.29 needs neo4j>=5.26.0. Neither our
+# code path (FalkorDB) nor MiroFish's OASIS sim uses the neo4j driver — it is an inert transitive
+# dep — so force a single 5.26 (an LTS) to satisfy graphiti and keep the adapter on 0.29 (ADR 0009).
+override-dependencies = ["neo4j==5.26.0"]
 
 [build-system]
 requires = ["hatchling"]
