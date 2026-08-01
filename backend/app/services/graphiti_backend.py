@@ -31,8 +31,10 @@ from the environment, and is designed to run on **MiroFish's existing OpenRouter
     ``FALKORDB_HOST`` / ``_PORT``     FalkorDB address (default ``localhost`` / ``6379``)
     ================================  ==========================================================
 
-OpenRouter has no embeddings endpoint, so embeddings default to a **local** fastembed model — that is
-what lets the whole backend run on the existing OpenRouter key alone. The FalkorDB *process* and its
+Embeddings default to a **local** fastembed model (no key). OpenRouter *does* offer an embeddings
+endpoint, but local wins here: a cluster makes hundreds of embeds, so remote adds sequential network
+latency + rate limits + a multi-year model-deprecation risk for ~$0 saved (see ADR 0009). The
+FalkorDB *process* and its
 RDB-file persistence to GCS are managed separately by the trade-gpt worker (``falkordb_session``);
 this module only talks to an already-running FalkorDB.
 """
@@ -52,7 +54,10 @@ logger = logging.getLogger("mirofish.graphiti_backend")
 DEFAULT_MODEL = "gpt-4o-mini"
 DEFAULT_EMBED_MODEL = "text-embedding-3-small"
 #: Free local embedding model (fastembed / ONNX — no torch, no GPU, no API key). Small & fast; ample
-#: for news-entity similarity on a few-MB graph.
+#: for news-entity similarity on a few-MB graph. **English-only** — matched to the Alpaca (US-market)
+#: news source, which is English. graphiti extracts in the source language, so if non-English news is
+#: ever ingested, switch GRAPHITI_EMBED_MODEL to a local multilingual model (e.g.
+#: intfloat/multilingual-e5-large) and REBUILD the graph. See ADR 0009 "Embedding model & language".
 DEFAULT_LOCAL_EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 #: Cap on nodes/edges pulled per read-back page (Graphiti paginates via ``uuid_cursor``).
 READ_PAGE_SIZE = 500
@@ -143,6 +148,10 @@ class GraphitiBackend:
         self.api_key = api_key or os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
         self.base_url = base_url or os.environ.get("LLM_BASE_URL") or None
         self.model = model or os.environ.get("GRAPHITI_MODEL", DEFAULT_MODEL)
+        # Graphiti asks for a "small" model on several extraction steps; its default is gpt-4.1-nano,
+        # an unroutable slug on OpenRouter. Default the small model to the SAME routable model so
+        # every extraction call hits a model OpenRouter can serve (override via GRAPHITI_SMALL_MODEL).
+        self.small_model = os.environ.get("GRAPHITI_SMALL_MODEL") or self.model
         # Embeddings: OpenRouter has none, so default to a free LOCAL embedder (zero new credentials).
         self.embedder_kind = (embedder or os.environ.get("GRAPHITI_EMBEDDER", "local")).lower()
         self.embed_model = embed_model or os.environ.get("GRAPHITI_EMBED_MODEL", DEFAULT_EMBED_MODEL)
@@ -167,12 +176,21 @@ class GraphitiBackend:
         if self._graphiti is None:
             from graphiti_core import Graphiti
             from graphiti_core.driver.falkordb_driver import FalkorDriver
-            from graphiti_core.llm_client import LLMConfig, OpenAIClient
+            from graphiti_core.llm_client import LLMConfig
+            from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 
             driver = FalkorDriver(host=self.host, port=self.port, database=self.database)
-            # OpenAI-compatible client; base_url points it at OpenRouter (or OpenAI when unset).
-            llm = OpenAIClient(config=LLMConfig(
-                api_key=self.api_key, model=self.model, base_url=self.base_url))
+            # Use the GENERIC OpenAI-compatible client, NOT the default OpenAIClient: the default
+            # routes structured extraction through OpenAI's Responses API (POST /responses), which
+            # OpenRouter does not implement (it serves only /chat/completions) -> extraction would
+            # 404 on every run. OpenAIGenericClient talks pure /chat/completions. Default to
+            # json_object structured output (schema injected into the prompt) since it works on every
+            # OpenAI-compatible provider incl. OpenRouter/DeepSeek; override via GRAPHITI_STRUCTURED.
+            mode = (os.environ.get("GRAPHITI_STRUCTURED") or "json_object").lower()
+            llm = OpenAIGenericClient(
+                config=LLMConfig(api_key=self.api_key, model=self.model,
+                                 small_model=self.small_model, base_url=self.base_url),
+                structured_output_mode=mode)
             # cross_encoder MUST be passed: Graphiti's default is an OpenAIRerankerClient that reads
             # OPENAI_API_KEY at construction, which we don't set (we run on OpenRouter). Default to a
             # free passthrough reranker (no key/model/network); GRAPHITI_RERANKER=openai opts into the
@@ -353,7 +371,8 @@ def _make_local_embedder(model_name: Optional[str] = None):
 
     Defined lazily so this module imports without ``graphiti_core``/``fastembed`` present. Lets the
     whole backend run on MiroFish's existing OpenRouter key (extraction) + local embeddings, needing
-    zero new credentials — OpenRouter itself has no embeddings endpoint (ADR 0009).
+    zero new credentials. Local (not remote OpenRouter embeddings) is a deliberate choice — see
+    ADR 0009 "Embedding model & language".
     """
     from graphiti_core.embedder.client import EmbedderClient
     from fastembed import TextEmbedding
