@@ -994,12 +994,16 @@ def _append_graph_impl():
                     progress=10,
                 )
                 # No create_graph, no set_ontology: append into the existing
-                # graph under its already-set (frozen) ontology.
+                # graph under its already-set (frozen) ontology. The Zep backend
+                # remembers that ontology server-side; the Graphiti backend applies
+                # it per-episode, so pass the project's frozen ontology through
+                # (ignored by the Zep path).
                 submission = builder.add_text_batches(
                     graph_id,
                     chunks,
                     batch_size=350,
                     progress_callback=add_progress_callback,
+                    ontology=project.ontology,
                 )
 
                 def wait_progress_callback(msg, progress_ratio):

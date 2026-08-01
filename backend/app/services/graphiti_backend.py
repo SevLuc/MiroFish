@@ -58,7 +58,10 @@ _RESERVED_ATTRS = {"uuid", "name", "group_id", "labels", "summary", "fact", "cre
 
 
 def _pascal(name: str) -> str:
-    return "".join(w.capitalize() for w in str(name).replace("-", "_").split("_") if w) or "Entity"
+    # Split on spaces/underscores/hyphens so multi-word ontology names become a single valid
+    # PascalCase label ("ai chip" -> "AiChip"); a space would be fragile as a Graphiti/Cypher label.
+    cleaned = str(name).replace("-", "_").replace(" ", "_")
+    return "".join(w.capitalize() for w in cleaned.split("_") if w) or "Entity"
 
 
 def _model_from_attributes(type_name: str, attributes: list[dict]) -> type[BaseModel]:
@@ -144,6 +147,7 @@ class GraphitiBackend:
             raise ValueError("no extraction key: set LLM_API_KEY (OpenRouter) or OPENAI_API_KEY")
         self._graphiti = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._indices_built = False
 
     # -- lifecycle -------------------------------------------------------- #
     def _loop_get(self) -> asyncio.AbstractEventLoop:
@@ -184,6 +188,12 @@ class GraphitiBackend:
     def init_indices(self) -> None:
         """One-time index/constraint setup (BM25 + vector). Idempotent; run on a fresh DB file."""
         self._run(self._client().build_indices_and_constraints())
+        self._indices_built = True
+
+    def _ensure_indices(self) -> None:
+        """Build indices once per process before the first write (cheap no-op if already present)."""
+        if not self._indices_built:
+            self.init_indices()
 
     def close(self) -> None:
         if self._graphiti is not None:
@@ -207,6 +217,7 @@ class GraphitiBackend:
         """
         from graphiti_core.nodes import EpisodeType
 
+        self._ensure_indices()
         entity_types, edge_types, edge_type_map = (
             ontology_to_graphiti_types(ontology) if ontology else ({}, {}, {}))
         ref = reference_time or datetime.now(timezone.utc)

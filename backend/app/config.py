@@ -29,7 +29,11 @@ class Config:
     LLM_BASE_URL = os.environ.get('LLM_BASE_URL', 'https://api.openai.com/v1')
     LLM_MODEL_NAME = os.environ.get('LLM_MODEL_NAME', 'gpt-4o-mini')
     
-    # Zep配置
+    # 图谱后端选择 (ADR 0009): 'graphiti' (自托管, 默认) 或 'zep' (旧版 Zep Cloud, 休眠).
+    # graphiti 使用现有 OpenRouter 凭据 + 本地 FalkorDB, 无需 ZEP_API_KEY.
+    GRAPH_BACKEND = (os.environ.get('GRAPH_BACKEND') or 'graphiti').strip().lower()
+
+    # Zep配置 (仅 GRAPH_BACKEND=zep 时需要)
     ZEP_API_KEY = os.environ.get('ZEP_API_KEY')
     
     # 文件上传配置
@@ -78,10 +82,13 @@ class Config:
         errors: list[str] = []
         if not cls.LLM_API_KEY:
             errors.append("LLM_API_KEY 未配置")
-        if not cls.ZEP_API_KEY:
-            errors.append("ZEP_API_KEY 未配置")
-        if os.environ.get("ZEP_API_URL"):
-            errors.append("ZEP_API_URL 不受支持；MiroFish 仅连接 Zep Cloud")
+        # ZEP_API_KEY is only required for the dormant Zep backend. The default
+        # graphiti backend (ADR 0009) reuses LLM_API_KEY and needs no Zep key.
+        if cls.GRAPH_BACKEND == 'zep':
+            if not cls.ZEP_API_KEY:
+                errors.append("ZEP_API_KEY 未配置")
+            if os.environ.get("ZEP_API_URL"):
+                errors.append("ZEP_API_URL 不受支持；MiroFish 仅连接 Zep Cloud")
         if cls.DEBUG:
             import warnings
             warnings.warn("Flask DEBUG mode is enabled. Do not use in production.", RuntimeWarning)

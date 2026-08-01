@@ -27,6 +27,7 @@ from ..utils.zep import (
     normalize_zep_search_query,
 )
 from .zep_entity_reader import EntityNode, ZepEntityReader
+from .graph_backend import use_graphiti, get_graphiti_backend
 
 logger = get_logger('mirofish.oasis_profile')
 
@@ -359,10 +360,15 @@ class OasisProfileGenerator:
             包含facts, node_summaries, context的字典
         """
         import concurrent.futures
-        
+
+        # GRAPH_BACKEND=graphiti (ADR 0009): enrich from the self-hosted backend's semantic
+        # search instead of Zep, so persona context is not lost under the new backend.
+        if use_graphiti():
+            return self._search_graphiti_for_entity(entity)
+
         if not self.zep_client:
             return {"facts": [], "node_summaries": [], "context": ""}
-        
+
         entity_name = entity.name
         
         results = {
@@ -454,6 +460,54 @@ class OasisProfileGenerator:
         
         return results
     
+    def _search_graphiti_for_entity(self, entity: EntityNode) -> Dict[str, Any]:
+        """Graphiti equivalent of :meth:`_search_zep_for_entity` (facts/node_summaries/context).
+
+        Facts come from Graphiti's semantic edge search; related-entity summaries from a light
+        keyword match over the cluster's nodes (no separate node-search API needed). Same output
+        shape and same graceful-degradation contract, so persona building is backend-agnostic.
+        """
+        results = {"facts": [], "node_summaries": [], "context": ""}
+        if not self.graph_id:
+            logger.debug("跳过Graphiti检索：未设置graph_id")
+            return results
+
+        entity_name = entity.name
+        query = normalize_zep_search_query(t('progress.zepSearchQuery', name=entity_name))
+        try:
+            backend = get_graphiti_backend()
+            search = backend.search_graph(self.graph_id, query, limit=30)
+            facts = set()
+            for edge in search.get("edges") or []:
+                fact = getattr(edge, "fact", "") or ""
+                if fact:
+                    facts.add(fact)
+            results["facts"] = list(facts)
+
+            # Related-entity summaries: keyword-match the cluster's nodes (Graphiti search returns
+            # edges; nodes are matched locally to mirror Zep's node-scope search cheaply).
+            name_l = entity_name.lower()
+            summaries = set()
+            for node in backend.get_all_nodes(self.graph_id):
+                nm, summ = node.get("name") or "", node.get("summary") or ""
+                if summ and (name_l in summ.lower() or (nm and nm.lower() != name_l and name_l in nm.lower())):
+                    summaries.add(summ)
+                    if nm and nm.lower() != name_l:
+                        summaries.add(f"相关实体: {nm}")
+            results["node_summaries"] = list(summaries)
+
+            context_parts = []
+            if results["facts"]:
+                context_parts.append("事实信息:\n" + "\n".join(f"- {f}" for f in results["facts"][:20]))
+            if results["node_summaries"]:
+                context_parts.append("相关实体:\n" + "\n".join(f"- {s}" for s in results["node_summaries"][:10]))
+            results["context"] = "\n\n".join(context_parts)
+            logger.info(f"Graphiti检索完成: {entity_name}, {len(results['facts'])} 事实, "
+                        f"{len(results['node_summaries'])} 相关节点")
+        except Exception as e:
+            logger.warning(f"Graphiti检索失败 ({entity_name}): {e}")
+        return results
+
     def _build_entity_context(self, entity: EntityNode) -> str:
         """
         构建实体的完整上下文信息

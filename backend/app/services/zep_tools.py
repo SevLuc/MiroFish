@@ -25,6 +25,7 @@ from ..utils.zep import (
     normalize_zep_search_limit,
     normalize_zep_search_query,
 )
+from .graph_backend import use_graphiti, get_graphiti_backend
 
 logger = get_logger('mirofish.zep_tools')
 
@@ -428,11 +429,17 @@ class ZepToolsService:
     RETRY_DELAY = 2.0
     
     def __init__(self, api_key: Optional[str] = None, llm_client: Optional[LLMClient] = None):
-        self.api_key = api_key or Config.ZEP_API_KEY
-        if not self.api_key:
-            raise ValueError("ZEP_API_KEY 未配置")
-        
-        self.client = get_zep_client(self.api_key)
+        # GRAPH_BACKEND=graphiti (ADR 0009): graph reads/search route to the self-hosted
+        # backend; no Zep client / key required. The LLM client (for InsightForge sub-questions)
+        # is still used, so keep it available.
+        if use_graphiti():
+            self.api_key = None
+            self.client = None
+        else:
+            self.api_key = api_key or Config.ZEP_API_KEY
+            if not self.api_key:
+                raise ValueError("ZEP_API_KEY 未配置")
+            self.client = get_zep_client(self.api_key)
         # LLM客户端用于InsightForge生成子问题
         self._llm_client = llm_client
         logger.info(t("console.zepToolsInitialized"))
@@ -477,7 +484,10 @@ class ZepToolsService:
             SearchResult: 搜索结果
         """
         logger.info(t("console.graphSearch", graphId=graph_id, query=query[:50]))
-        
+
+        if use_graphiti():
+            return self._graphiti_search(graph_id, query, limit, scope)
+
         zep_query = normalize_zep_search_query(query)
         zep_limit = normalize_zep_search_limit(limit)
 
@@ -539,10 +549,44 @@ class ZepToolsService:
             logger.error(t("console.zepSearchApiFallback", error=str(e)))
             raise
     
+    def _graphiti_search(
+        self,
+        graph_id: str,
+        query: str,
+        limit: int = 10,
+        scope: str = "edges",
+    ) -> SearchResult:
+        """Semantic (hybrid vector + BM25) edge search via the self-hosted Graphiti backend.
+
+        Mirrors the Zep ``search_graph`` edge path: ``facts`` are edge ``fact`` strings and ``edges``
+        the same dict shape. Node-scope searches reuse :meth:`_local_search`, whose ``get_all_nodes``
+        already routes to Graphiti, so both scopes stay functional without a second search API.
+        """
+        if scope == "nodes":
+            return self._local_search(graph_id, query, limit, scope)
+
+        result = get_graphiti_backend().search_graph(graph_id, query, limit=limit)
+        facts: List[str] = []
+        edges: List[Dict[str, Any]] = []
+        for edge in result.get("edges") or []:
+            fact = getattr(edge, "fact", "") or ""
+            if fact:
+                facts.append(fact)
+            edges.append({
+                "uuid": getattr(edge, "uuid", "") or "",
+                "name": getattr(edge, "name", "") or "",
+                "fact": fact,
+                "source_node_uuid": getattr(edge, "source_node_uuid", "") or "",
+                "target_node_uuid": getattr(edge, "target_node_uuid", "") or "",
+            })
+        logger.info(t("console.searchComplete", count=len(facts)))
+        return SearchResult(
+            facts=facts, edges=edges, nodes=[], query=query, total_count=len(facts))
+
     def _local_search(
-        self, 
-        graph_id: str, 
-        query: str, 
+        self,
+        graph_id: str,
+        query: str,
         limit: int = 10,
         scope: str = "edges"
     ) -> SearchResult:
@@ -655,6 +699,14 @@ class ZepToolsService:
         """
         logger.info(t("console.fetchingAllNodes", graphId=graph_id))
 
+        if use_graphiti():
+            out = [NodeInfo(
+                uuid=n["uuid"], name=n["name"], labels=n["labels"],
+                summary=n["summary"], attributes=n["attributes"],
+            ) for n in get_graphiti_backend().get_all_nodes(graph_id)]
+            logger.info(t("console.fetchedNodes", count=len(out)))
+            return out
+
         nodes = fetch_all_nodes(self.client, graph_id)
 
         result = []
@@ -683,6 +735,22 @@ class ZepToolsService:
             边列表（包含created_at, valid_at, invalid_at, expired_at）
         """
         logger.info(t("console.fetchingAllEdges", graphId=graph_id))
+
+        if use_graphiti():
+            out = []
+            for e in get_graphiti_backend().get_all_edges(graph_id):
+                ei = EdgeInfo(
+                    uuid=e["uuid"], name=e["name"], fact=e["fact"],
+                    source_node_uuid=e["source_node_uuid"] or "",
+                    target_node_uuid=e["target_node_uuid"] or "",
+                )
+                if include_temporal:
+                    ei.valid_at = e.get("valid_at")
+                    ei.invalid_at = e.get("invalid_at")
+                    ei.expired_at = e.get("expired_at")
+                out.append(ei)
+            logger.info(t("console.fetchedEdges", count=len(out)))
+            return out
 
         edges = fetch_all_edges(self.client, graph_id)
 
