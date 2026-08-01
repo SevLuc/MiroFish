@@ -24,6 +24,10 @@ from the environment, and is designed to run on **MiroFish's existing OpenRouter
                                       ``openai/gpt-4o-mini``)
     ``GRAPHITI_EMBEDDER``             ``local`` (default — free fastembed, no key) or ``openai``
     ``GRAPHITI_EMBED_MODEL``          embedding model when ``GRAPHITI_EMBEDDER=openai``
+    ``FASTEMBED_CACHE_DIR``           where the local ONNX model lives (bake it at image build so a
+                                      run never downloads it)
+    ``GRAPHITI_RERANKER``             ``passthrough`` (default — free, keeps hybrid-rank order) or
+                                      ``openai`` (LLM reranker via the same OpenRouter creds)
     ``FALKORDB_HOST`` / ``_PORT``     FalkorDB address (default ``localhost`` / ``6379``)
     ================================  ==========================================================
 
@@ -169,9 +173,27 @@ class GraphitiBackend:
             # OpenAI-compatible client; base_url points it at OpenRouter (or OpenAI when unset).
             llm = OpenAIClient(config=LLMConfig(
                 api_key=self.api_key, model=self.model, base_url=self.base_url))
+            # cross_encoder MUST be passed: Graphiti's default is an OpenAIRerankerClient that reads
+            # OPENAI_API_KEY at construction, which we don't set (we run on OpenRouter). Default to a
+            # free passthrough reranker (no key/model/network); GRAPHITI_RERANKER=openai opts into the
+            # LLM reranker on our OpenRouter creds.
             self._graphiti = Graphiti(
-                graph_driver=driver, llm_client=llm, embedder=self._build_embedder())
+                graph_driver=driver, llm_client=llm, embedder=self._build_embedder(),
+                cross_encoder=self._build_cross_encoder())
         return self._graphiti
+
+    def _build_cross_encoder(self):
+        """Passthrough reranker by default (free, no key); OpenRouter LLM reranker when selected.
+
+        Graphiti already hybrid-ranks (vector + BM25) before the cross-encoder, so preserving that
+        order is a sound €0 default. ``GRAPHITI_RERANKER=openai`` uses the LLM reranker via the same
+        OpenRouter creds (only if that model/endpoint supports the reranking call)."""
+        if (os.environ.get("GRAPHITI_RERANKER") or "passthrough").lower() == "openai":
+            from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
+            from graphiti_core.llm_client import LLMConfig
+            return OpenAIRerankerClient(config=LLMConfig(
+                api_key=self.api_key, model=self.model, base_url=self.base_url))
+        return _make_passthrough_reranker()
 
     def _build_embedder(self):
         """Local fastembed by default (free, no key); OpenAI embeddings when explicitly selected."""
@@ -309,6 +331,23 @@ def _entity_edge():
     return EntityEdge
 
 
+def _make_passthrough_reranker():
+    """A free, no-key cross-encoder that keeps Graphiti's existing hybrid-ranking order.
+
+    Graphiti requires a ``cross_encoder``; its default (``OpenAIRerankerClient``) needs an
+    ``OPENAI_API_KEY`` we don't set. Search results already arrive vector+BM25-ranked, so returning
+    them in order (descending scores) is a sound €0 default with no model, key, or network. Defined
+    lazily so this module imports without ``graphiti_core`` present."""
+    from graphiti_core.cross_encoder.client import CrossEncoderClient
+
+    class _PassthroughReranker(CrossEncoderClient):
+        async def rank(self, query: str, passages: list) -> list:
+            n = len(passages)
+            return [(p, (n - i) / n) for i, p in enumerate(passages)]
+
+    return _PassthroughReranker()
+
+
 def _make_local_embedder(model_name: Optional[str] = None):
     """A free, no-key Graphiti embedder backed by fastembed (ONNX; no torch/GPU/API key).
 
@@ -319,7 +358,10 @@ def _make_local_embedder(model_name: Optional[str] = None):
     from graphiti_core.embedder.client import EmbedderClient
     from fastembed import TextEmbedding
 
-    model = TextEmbedding(model_name=model_name or DEFAULT_LOCAL_EMBED_MODEL)
+    # A fixed cache dir (env-set) lets the worker image bake the ONNX model at BUILD time so the
+    # weekly run never depends on a HuggingFace download — key for a hands-off multi-year job.
+    cache_dir = os.environ.get("FASTEMBED_CACHE_DIR") or None
+    model = TextEmbedding(model_name=model_name or DEFAULT_LOCAL_EMBED_MODEL, cache_dir=cache_dir)
 
     class _LocalEmbedder(EmbedderClient):
         async def create(self, input_data):
