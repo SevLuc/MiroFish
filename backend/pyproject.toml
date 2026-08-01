@@ -23,6 +23,9 @@ dependencies = [
     # Graphiti — self-hosted graph backend (GRAPH_BACKEND=graphiti, ADR 0009). Same engine Zep runs;
     # drives a local FalkorDB. Pulls falkordb (the client) via the extra.
     "graphiti-core[falkordb]>=0.3.0",
+    # Free local embeddings (fastembed/ONNX, no key) so the backend runs on the existing OpenRouter
+    # key alone — OpenRouter has no embeddings endpoint. Only needed for GRAPHITI_EMBEDDER=local.
+    "fastembed>=0.3.0",
     
     # OASIS 社交媒体模拟
     "camel-oasis==0.2.5",

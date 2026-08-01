@@ -12,18 +12,25 @@ Why this is a drop-in for the Zep reader/tools:
     ``graphiti_core.edges.EntityEdge`` expose, so :meth:`get_all_nodes` / :meth:`get_all_edges` /
     :meth:`search_graph` return the **same dict shapes** as ``zep_entity_reader`` / ``zep_tools``.
 
-Deliberately self-contained (only ``graphiti_core`` + ``pydantic`` + stdlib) so it can be unit-tested
-and imported without the rest of the MiroFish backend. Configuration is read from the environment:
+Imported without ``graphiti_core`` present, the pure-logic helpers (e.g. ``ontology_to_graphiti_types``)
+still work — the engine is imported lazily inside the methods that need it. Configuration is read
+from the environment, and is designed to run on **MiroFish's existing OpenRouter credential** with
+**no new key** (ADR 0009):
 
     ================================  ==========================================================
-    ``OPENAI_API_KEY``                extraction + embedding key (replaces ``ZEP_API_KEY``)
-    ``GRAPHITI_MODEL``                extraction model (default ``gpt-4o-mini`` — ADR 0009)
-    ``GRAPHITI_EMBED_MODEL``          embedding model (default ``text-embedding-3-small``)
+    ``LLM_API_KEY`` / ``LLM_BASE_URL`` reused for extraction — OpenRouter proxies ``gpt-4o-mini``
+                                      (falls back to ``OPENAI_API_KEY`` / OpenAI default base_url)
+    ``GRAPHITI_MODEL``                extraction model (default ``gpt-4o-mini``; on OpenRouter set
+                                      ``openai/gpt-4o-mini``)
+    ``GRAPHITI_EMBEDDER``             ``local`` (default — free fastembed, no key) or ``openai``
+    ``GRAPHITI_EMBED_MODEL``          embedding model when ``GRAPHITI_EMBEDDER=openai``
     ``FALKORDB_HOST`` / ``_PORT``     FalkorDB address (default ``localhost`` / ``6379``)
     ================================  ==========================================================
 
-The FalkorDB *process* itself and its RDB-file persistence to GCS are managed separately by
-``falkordb_lifecycle`` — this module only talks to an already-running FalkorDB.
+OpenRouter has no embeddings endpoint, so embeddings default to a **local** fastembed model — that is
+what lets the whole backend run on the existing OpenRouter key alone. The FalkorDB *process* and its
+RDB-file persistence to GCS are managed separately by the trade-gpt worker (``falkordb_session``);
+this module only talks to an already-running FalkorDB.
 """
 
 from __future__ import annotations
@@ -40,6 +47,9 @@ logger = logging.getLogger("mirofish.graphiti_backend")
 
 DEFAULT_MODEL = "gpt-4o-mini"
 DEFAULT_EMBED_MODEL = "text-embedding-3-small"
+#: Free local embedding model (fastembed / ONNX — no torch, no GPU, no API key). Small & fast; ample
+#: for news-entity similarity on a few-MB graph.
+DEFAULT_LOCAL_EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 #: Cap on nodes/edges pulled per read-back page (Graphiti paginates via ``uuid_cursor``).
 READ_PAGE_SIZE = 500
 #: Reserved attribute keys Graphiti manages itself — never surface them as ontology attributes.
@@ -117,15 +127,21 @@ class GraphitiBackend:
 
     def __init__(self, *, host: Optional[str] = None, port: Optional[int] = None,
                  model: Optional[str] = None, embed_model: Optional[str] = None,
-                 api_key: Optional[str] = None, database: str = "default_db"):
+                 api_key: Optional[str] = None, base_url: Optional[str] = None,
+                 embedder: Optional[str] = None, database: str = "default_db"):
         self.host = host or os.environ.get("FALKORDB_HOST", "localhost")
         self.port = int(port or os.environ.get("FALKORDB_PORT", "6379"))
+        # Extraction: reuse MiroFish's existing OpenRouter creds so NO new key is needed — OpenRouter
+        # proxies gpt-4o-mini. Fall back to OPENAI_API_KEY (+ OpenAI default base_url) if that is set.
+        self.api_key = api_key or os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
+        self.base_url = base_url or os.environ.get("LLM_BASE_URL") or None
         self.model = model or os.environ.get("GRAPHITI_MODEL", DEFAULT_MODEL)
+        # Embeddings: OpenRouter has none, so default to a free LOCAL embedder (zero new credentials).
+        self.embedder_kind = (embedder or os.environ.get("GRAPHITI_EMBEDDER", "local")).lower()
         self.embed_model = embed_model or os.environ.get("GRAPHITI_EMBED_MODEL", DEFAULT_EMBED_MODEL)
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
         self.database = database
         if not self.api_key:
-            raise ValueError("OPENAI_API_KEY not set (extraction + embeddings)")
+            raise ValueError("no extraction key: set LLM_API_KEY (OpenRouter) or OPENAI_API_KEY")
         self._graphiti = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -139,19 +155,31 @@ class GraphitiBackend:
         return self._loop_get().run_until_complete(coro)
 
     def _client(self):
-        """Lazily build the Graphiti client bound to FalkorDB + OpenAI (extraction + embeddings)."""
+        """Lazily build the Graphiti client bound to FalkorDB, the extraction LLM, and an embedder."""
         if self._graphiti is None:
             from graphiti_core import Graphiti
             from graphiti_core.driver.falkordb_driver import FalkorDriver
             from graphiti_core.llm_client import LLMConfig, OpenAIClient
-            from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 
             driver = FalkorDriver(host=self.host, port=self.port, database=self.database)
-            llm = OpenAIClient(config=LLMConfig(api_key=self.api_key, model=self.model))
-            embedder = OpenAIEmbedder(
-                config=OpenAIEmbedderConfig(api_key=self.api_key, embedding_model=self.embed_model))
-            self._graphiti = Graphiti(graph_driver=driver, llm_client=llm, embedder=embedder)
+            # OpenAI-compatible client; base_url points it at OpenRouter (or OpenAI when unset).
+            llm = OpenAIClient(config=LLMConfig(
+                api_key=self.api_key, model=self.model, base_url=self.base_url))
+            self._graphiti = Graphiti(
+                graph_driver=driver, llm_client=llm, embedder=self._build_embedder())
         return self._graphiti
+
+    def _build_embedder(self):
+        """Local fastembed by default (free, no key); OpenAI embeddings when explicitly selected."""
+        if self.embedder_kind == "openai":
+            from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
+            key = os.environ.get("OPENAI_API_KEY")
+            if not key:
+                raise ValueError("GRAPHITI_EMBEDDER=openai requires OPENAI_API_KEY "
+                                 "(OpenRouter has no embeddings endpoint)")
+            return OpenAIEmbedder(config=OpenAIEmbedderConfig(
+                api_key=key, embedding_model=self.embed_model))
+        return _make_local_embedder()
 
     def init_indices(self) -> None:
         """One-time index/constraint setup (BM25 + vector). Idempotent; run on a fresh DB file."""
@@ -268,3 +296,26 @@ def _entity_node():
 def _entity_edge():
     from graphiti_core.edges import EntityEdge
     return EntityEdge
+
+
+def _make_local_embedder(model_name: Optional[str] = None):
+    """A free, no-key Graphiti embedder backed by fastembed (ONNX; no torch/GPU/API key).
+
+    Defined lazily so this module imports without ``graphiti_core``/``fastembed`` present. Lets the
+    whole backend run on MiroFish's existing OpenRouter key (extraction) + local embeddings, needing
+    zero new credentials — OpenRouter itself has no embeddings endpoint (ADR 0009).
+    """
+    from graphiti_core.embedder.client import EmbedderClient
+    from fastembed import TextEmbedding
+
+    model = TextEmbedding(model_name=model_name or DEFAULT_LOCAL_EMBED_MODEL)
+
+    class _LocalEmbedder(EmbedderClient):
+        async def create(self, input_data):
+            text = input_data if isinstance(input_data, str) else " ".join(map(str, input_data))
+            return next(iter(model.embed([text]))).tolist()
+
+        async def create_batch(self, input_data_list):
+            return [vec.tolist() for vec in model.embed(list(input_data_list))]
+
+    return _LocalEmbedder()
