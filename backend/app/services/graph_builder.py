@@ -29,6 +29,7 @@ from ..utils.zep import (
 )
 from .text_processor import TextProcessor
 from ..utils.locale import t, get_locale, set_locale
+from .graph_backend import use_graphiti, get_graphiti_backend
 
 
 @dataclass
@@ -65,10 +66,20 @@ class GraphBuilderService:
     """
     
     def __init__(self, api_key: Optional[str] = None):
+        # Ontology stashed by set_ontology within a build so add_text_batches can pass it to
+        # Graphiti's typed extraction (Zep held it server-side; Graphiti takes it per-episode).
+        self._graphiti_ontology: Optional[Dict[str, Any]] = None
+        # GRAPH_BACKEND=graphiti (ADR 0009): writes route to the self-hosted backend + local
+        # FalkorDB; no Zep client / key required.
+        if use_graphiti():
+            self.api_key = None
+            self.client = None
+            self.task_manager = TaskManager()
+            return
         self.api_key = api_key or Config.ZEP_API_KEY
         if not self.api_key:
             raise ValueError("ZEP_API_KEY 未配置")
-        
+
         self.client = get_zep_client(self.api_key)
         self.task_manager = TaskManager()
     
@@ -230,6 +241,11 @@ class GraphBuilderService:
         if graph_id_callback:
             graph_id_callback(graph_id)
 
+        if use_graphiti():
+            # Graphiti has no server-side "create graph": a cluster is just a group_id, created
+            # on first add_episode. Nothing to call — the ID is the group_id we ingest under.
+            return graph_id
+
         try:
             self.client.graph.create(
                 graph_id=graph_id,
@@ -312,6 +328,12 @@ class GraphBuilderService:
     
     def set_ontology(self, graph_id: str, ontology: Dict[str, Any]):
         """设置图谱本体（公开方法）"""
+        if use_graphiti():
+            # Graphiti applies the ontology at extraction time (per add_episode), not as a
+            # persisted server-side schema — stash it so add_text_batches can pass it through.
+            self._graphiti_ontology = ontology
+            return
+
         import warnings
         from typing import Optional
         from pydantic import Field
@@ -411,6 +433,7 @@ class GraphBuilderService:
         batch_size: int = 350,
         progress_callback: Optional[Callable] = None,
         batch_created_callback: Optional[Callable[[str | None, str], None]] = None,
+        ontology: Optional[Dict[str, Any]] = None,
     ) -> BatchSubmission:
         """Submit document chunks through Zep's current Batch API.
 
@@ -418,11 +441,19 @@ class GraphBuilderService:
         documented as idempotent, and an ambiguous replay can duplicate graph
         episodes. The returned batch identity allows callers to persist and
         reconcile the operation instead.
+
+        Under ``GRAPH_BACKEND=graphiti`` the chunks are ingested directly into the local
+        FalkorDB via the Graphiti backend (one episode per chunk, extraction inline — no batch,
+        no server-side wait). ``ontology`` (or the one stashed by :meth:`set_ontology`) drives
+        typed extraction; on the append path the API passes ``project.ontology`` explicitly.
         """
 
         if not graph_id:
             raise ValueError("graph_id is required")
         self.validate_batch_chunks(chunks, batch_size=batch_size)
+
+        if use_graphiti():
+            return self._graphiti_add(graph_id, chunks, ontology, progress_callback)
 
         total_chunks = len(chunks)
         operation_id = self.build_operation_id(graph_id, chunks)
@@ -563,6 +594,35 @@ class GraphBuilderService:
             item_count=total_chunks,
         )
 
+    def _graphiti_add(
+        self,
+        graph_id: str,
+        chunks: List[str],
+        ontology: Optional[Dict[str, Any]],
+        progress_callback: Optional[Callable],
+    ) -> BatchSubmission:
+        """Ingest chunks into the local FalkorDB via Graphiti (GRAPH_BACKEND=graphiti).
+
+        One episode per chunk, extraction inline. Returns a :class:`BatchSubmission` whose id is
+        synthetic (there is no Zep batch); :meth:`_wait_for_batch` no-ops for it since ingestion
+        already completed here.
+        """
+        ontology = ontology or self._graphiti_ontology
+
+        def _progress(msg, ratio):
+            if progress_callback:
+                progress_callback(msg, ratio)
+
+        count = get_graphiti_backend().add_documents(
+            graph_id, chunks, ontology=ontology, progress=_progress)
+        operation_id = self.build_operation_id(graph_id, chunks)
+        return BatchSubmission(
+            batch_id=f"graphiti:{operation_id}",
+            operation_id=operation_id,
+            episode_uuids=[],
+            item_count=count,
+        )
+
     @staticmethod
     def validate_batch_chunks(chunks: List[str], *, batch_size: int = 350) -> None:
         """Validate every Batch API limit before the first Cloud mutation."""
@@ -623,6 +683,11 @@ class GraphBuilderService:
     def get_batch_summary(self, batch_id: str) -> Any:
         """Read a persisted batch identity for restart reconciliation."""
 
+        if use_graphiti():
+            # No Zep batches under Graphiti (ingestion is synchronous). Report "not resumable"
+            # so the API's resume-existing-batch path is never taken for a Graphiti graph.
+            return None
+
         return call_zep_read_with_retry(
             lambda: self.client.batch.get(batch_id=batch_id),
             operation_name=f"get batch {batch_id}",
@@ -635,6 +700,16 @@ class GraphBuilderService:
         timeout: int | None = None,
     ) -> List[str]:
         """Wait for a Batch API terminal state and validate every item."""
+
+        if use_graphiti():
+            # Graphiti extraction already completed synchronously in add_text_batches — nothing
+            # to poll. Report done and return the (empty) episode list.
+            if progress_callback:
+                progress_callback(
+                    t('progress.processingComplete',
+                      completed=submission.item_count, total=submission.item_count),
+                    1.0)
+            return list(submission.episode_uuids)
 
         timeout = timeout or ZEP_INGESTION_WAIT_TIMEOUT_SECONDS
         start_time = time.time()
@@ -807,6 +882,9 @@ class GraphBuilderService:
         Returns:
             包含nodes和edges的字典，包括时间信息、属性等详细数据
         """
+        if use_graphiti():
+            return self._graphiti_graph_data(graph_id)
+
         nodes = fetch_all_nodes(self.client, graph_id)
         edges = fetch_all_edges(self.client, graph_id)
 
@@ -874,6 +952,42 @@ class GraphBuilderService:
             "edge_count": len(edges_data),
         }
     
+    def _graphiti_graph_data(self, graph_id: str) -> Dict[str, Any]:
+        """``get_graph_data`` for GRAPH_BACKEND=graphiti — same dict, sourced from FalkorDB.
+
+        Node/edge fields already match the Zep shape; source/target *names* are resolved from the
+        node set (Graphiti edges carry only UUIDs), and Zep-only extras (created_at/episodes/
+        fact_type) default to null/[] since nothing downstream requires them.
+        """
+        backend = get_graphiti_backend()
+        nodes = backend.get_all_nodes(graph_id)
+        edges = backend.get_all_edges(graph_id)
+        node_map = {n["uuid"]: n.get("name") or "" for n in nodes}
+
+        nodes_data = [{
+            "uuid": n["uuid"], "name": n["name"], "labels": n["labels"],
+            "summary": n["summary"], "attributes": n["attributes"], "created_at": None,
+        } for n in nodes]
+
+        edges_data = [{
+            "uuid": e["uuid"], "name": e["name"], "fact": e["fact"],
+            "fact_type": e["name"] or "",
+            "source_node_uuid": e["source_node_uuid"], "target_node_uuid": e["target_node_uuid"],
+            "source_node_name": node_map.get(e["source_node_uuid"], ""),
+            "target_node_name": node_map.get(e["target_node_uuid"], ""),
+            "attributes": e["attributes"], "created_at": None,
+            "valid_at": e.get("valid_at"), "invalid_at": e.get("invalid_at"),
+            "expired_at": e.get("expired_at"), "episodes": [],
+        } for e in edges]
+
+        return {
+            "graph_id": graph_id, "nodes": nodes_data, "edges": edges_data,
+            "node_count": len(nodes_data), "edge_count": len(edges_data),
+        }
+
     def delete_graph(self, graph_id: str):
         """删除图谱"""
+        if use_graphiti():
+            get_graphiti_backend().delete_cluster(graph_id)
+            return
         self.client.graph.delete(graph_id=graph_id)

@@ -11,6 +11,7 @@ from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.zep_paging import fetch_all_nodes, fetch_all_edges
 from ..utils.zep import call_zep_read_with_retry, get_zep_client
+from .graph_backend import use_graphiti, get_graphiti_backend
 
 logger = get_logger('mirofish.zep_entity_reader')
 
@@ -67,6 +68,22 @@ class FilteredEntities:
         }
 
 
+class _NodeView:
+    """Adapt a Graphiti node dict to the attribute access ``get_entity_with_context`` expects.
+
+    The Zep path receives a node *object* (``.name`` / ``.labels`` / ``.summary`` / ``.attributes``);
+    the Graphiti path has the same fields as a dict. This thin view lets the shared tail of
+    ``get_entity_with_context`` build its ``EntityNode`` unchanged for both backends.
+    """
+
+    def __init__(self, d: Dict[str, Any]):
+        self.uuid = d.get("uuid", "")
+        self.name = d.get("name", "")
+        self.labels = d.get("labels", [])
+        self.summary = d.get("summary", "")
+        self.attributes = d.get("attributes", {})
+
+
 class ZepEntityReader:
     """
     Zep实体读取与过滤服务
@@ -78,10 +95,16 @@ class ZepEntityReader:
     """
     
     def __init__(self, api_key: Optional[str] = None):
+        # GRAPH_BACKEND=graphiti (ADR 0009): reads route to the self-hosted Graphiti
+        # backend, so no Zep client / key is needed. Keep the class usable in that mode.
+        if use_graphiti():
+            self.api_key = None
+            self.client = None
+            return
         self.api_key = api_key or Config.ZEP_API_KEY
         if not self.api_key:
             raise ValueError("ZEP_API_KEY 未配置")
-        
+
         self.client = get_zep_client(self.api_key)
     
     def _call_with_retry(
@@ -122,6 +145,10 @@ class ZepEntityReader:
         """
         logger.info(f"获取图谱 {graph_id} 的所有节点...")
 
+        if use_graphiti():
+            # Graphiti already returns MiroFish's node shape (uuid/name/labels/summary/attributes).
+            return get_graphiti_backend().get_all_nodes(graph_id)
+
         nodes = fetch_all_nodes(self.client, graph_id)
 
         nodes_data = []
@@ -148,6 +175,10 @@ class ZepEntityReader:
             边列表
         """
         logger.info(f"获取图谱 {graph_id} 的所有边...")
+
+        if use_graphiti():
+            # Graphiti returns the same edge dict (+ harmless valid_at/invalid_at/expired_at extras).
+            return get_graphiti_backend().get_all_edges(graph_id)
 
         edges = fetch_all_edges(self.client, graph_id)
 
@@ -352,21 +383,29 @@ class ZepEntityReader:
             EntityNode或None
         """
         try:
-            # 使用重试机制获取节点
-            node = self._call_with_retry(
-                func=lambda: self.client.graph.node.get(uuid_=entity_uuid),
-                operation_name=f"获取节点详情(uuid={entity_uuid[:8]}...)"
-            )
-            
-            if not node:
-                return None
-            
-            # 获取节点的边
-            edges = self.get_node_edges(entity_uuid, graph_id=graph_id)
-            
-            # 获取所有节点用于关联查找
+            # 获取所有节点用于关联查找（graphiti 模式下同时用于定位目标节点）
             all_nodes = self.get_all_nodes(graph_id)
             node_map = {n["uuid"]: n for n in all_nodes}
+
+            if use_graphiti():
+                # No single-node fetch API needed: resolve the node from the group's node set,
+                # and its edges via get_node_edges(graph_id=...) which pages get_all_edges.
+                node_dict = node_map.get(entity_uuid)
+                if not node_dict:
+                    return None
+                node = _NodeView(node_dict)
+            else:
+                # 使用重试机制获取节点
+                node = self._call_with_retry(
+                    func=lambda: self.client.graph.node.get(uuid_=entity_uuid),
+                    operation_name=f"获取节点详情(uuid={entity_uuid[:8]}...)"
+                )
+
+                if not node:
+                    return None
+
+            # 获取节点的边
+            edges = self.get_node_edges(entity_uuid, graph_id=graph_id)
             
             # 处理相关边和节点
             related_edges = []
