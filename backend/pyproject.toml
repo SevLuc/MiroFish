@@ -37,6 +37,10 @@ dependencies = [
     # OASIS 社交媒体模拟
     "camel-oasis==0.2.5",
     "camel-ai==0.2.78",
+    # torch is a transitive dep (camel/sentence-transformers) — declare it directly so the CPU-wheel
+    # source below applies (uv sources only bind to DIRECT deps). The worker is CPU-only; the default
+    # CUDA torch drags in ~4-5GB of unused nvidia-*-cu12 libraries. See [tool.uv] pytorch-cpu index.
+    "torch==2.9.1",
     
     # 文件处理
     "PyMuPDF>=1.24.0",
@@ -61,6 +65,19 @@ dev = [
 # code path (FalkorDB) nor MiroFish's OASIS sim uses the neo4j driver — it is an inert transitive
 # dep — so force a single 5.26 (an LTS) to satisfy graphiti and keep the adapter on 0.29 (ADR 0009).
 override-dependencies = ["neo4j==5.26.0"]
+
+# CPU-only torch: the worker has no GPU, and default PyPI torch pulls ~4-5GB of NVIDIA CUDA libs
+# (36 nvidia-*-cu12 packages) that bloat the image, slow every build/pull, and overflow Cloud Shell's
+# disk (so the image can't be run locally to test). Pin torch to the CPU wheel index — camel /
+# sentence-transformers use it on CPU regardless, so behaviour is unchanged. The image build runs
+# `uv lock` (Cloud Build can reach this index) so the lockfile picks up the +cpu build.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
 
 [build-system]
 requires = ["hatchling"]
