@@ -54,6 +54,19 @@ logger = logging.getLogger("mirofish.graphiti_backend")
 
 DEFAULT_MODEL = "gpt-4o-mini"
 DEFAULT_EMBED_MODEL = "text-embedding-3-small"
+#: Structured-output mode for graphiti's OpenAIGenericClient. ``json_schema`` (graphiti's OWN
+#: default) sends the response schema to the API via ``response_format`` so required fields are
+#: enforced provider-side; ``json_object`` only prompt-injects the schema (unenforced) — the weaker
+#: mode this backend used to default to, which let ``gpt-4o-mini`` drop ``EdgeDuplicate`` fields and
+#: crash a 56-ticker cold-start. Override via ``GRAPHITI_STRUCTURED`` (set ``json_object`` only for a
+#: provider/model without json_schema support; the retry net below protects either mode).
+DEFAULT_STRUCTURED_MODE = "json_schema"
+#: How many times to re-request a structured extraction whose response fails schema validation
+#: before failing loud. graphiti returns the parsed dict unvalidated and never re-prompts on a schema
+#: miss, and the weekly worker runs with ``maxRetries=0`` — so without this a single dropped-field
+#: response across thousands of edge calls kills the whole build. Override via
+#: ``GRAPHITI_VALIDATION_RETRIES``.
+DEFAULT_VALIDATION_RETRIES = 3
 #: Free local embedding model (fastembed / ONNX — no torch, no GPU, no API key). Small & fast; ample
 #: for news-entity similarity on a few-MB graph. **English-only** — matched to the Alpaca (US-market)
 #: news source, which is English. graphiti extracts in the source language, so if non-English news is
@@ -144,6 +157,49 @@ def _iso(dt: Optional[datetime]) -> Optional[str]:
     return dt.isoformat() if isinstance(dt, datetime) else None
 
 
+def _structured_mode() -> str:
+    """Structured-output mode for the extraction client (``GRAPHITI_STRUCTURED`` or the default)."""
+    return (os.environ.get("GRAPHITI_STRUCTURED") or DEFAULT_STRUCTURED_MODE).strip().lower()
+
+
+def _validation_retries() -> int:
+    """How many times to re-request a schema-failing extraction (``GRAPHITI_VALIDATION_RETRIES``)."""
+    raw = os.environ.get("GRAPHITI_VALIDATION_RETRIES")
+    if not raw or not str(raw).strip():
+        return DEFAULT_VALIDATION_RETRIES
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_VALIDATION_RETRIES
+
+
+async def _generate_validated(gen, response_model, attempts):
+    """Call async ``gen()`` up to ``attempts`` times, returning the first result that validates
+    against ``response_model``; re-raise the last ``ValidationError`` if all attempts fail.
+
+    Why this exists: graphiti-core's client returns the parsed dict WITHOUT validating it against the
+    response model (the ``ValidationError`` only fires later — e.g. ``resolve_extracted_edge`` doing
+    ``EdgeDuplicate(**resp)``), and it never re-prompts on a schema miss. Non-strict ``json_schema``
+    output makes a dropped required field rare but not impossible, and the weekly worker runs with
+    ``maxRetries=0`` — so one bad response across thousands of edge calls would otherwise kill a
+    35-minute build. Re-requesting (the model is stochastic) self-heals it; exhausting the budget
+    still raises, so a genuine failure is loud, never silent.
+    """
+    from pydantic import ValidationError
+
+    last_error = None
+    for _ in range(max(1, attempts)):
+        result = await gen()
+        if response_model is None:
+            return result
+        try:
+            response_model.model_validate(result)
+            return result
+        except ValidationError as exc:
+            last_error = exc
+    raise last_error
+
+
 class GraphitiBackend:
     """Talks to a running FalkorDB via graphiti-core, returning MiroFish's dict shapes.
 
@@ -203,20 +259,25 @@ class GraphitiBackend:
             from graphiti_core import Graphiti
             from graphiti_core.driver.falkordb_driver import FalkorDriver
             from graphiti_core.llm_client import LLMConfig
-            from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 
             driver = FalkorDriver(host=self.host, port=self.port, database=self.database)
             # Use the GENERIC OpenAI-compatible client, NOT the default OpenAIClient: the default
             # routes structured extraction through OpenAI's Responses API (POST /responses), which
             # OpenRouter does not implement (it serves only /chat/completions) -> extraction would
-            # 404 on every run. OpenAIGenericClient talks pure /chat/completions. Default to
-            # json_object structured output (schema injected into the prompt) since it works on every
-            # OpenAI-compatible provider incl. OpenRouter/DeepSeek; override via GRAPHITI_STRUCTURED.
-            mode = (os.environ.get("GRAPHITI_STRUCTURED") or "json_object").lower()
-            llm = OpenAIGenericClient(
-                config=LLMConfig(api_key=self.api_key, model=self.model,
-                                 small_model=self.small_model, base_url=self.base_url),
-                structured_output_mode=mode)
+            # 404 on every run. OpenAIGenericClient talks pure /chat/completions.
+            #
+            # structured_output_mode defaults to `json_schema` (graphiti's OWN default): the response
+            # schema is sent to the provider via `response_format`, so required fields are enforced
+            # provider-side. The previous `json_object` default only PROMPT-injected the schema (no
+            # enforcement), which let gpt-4o-mini omit EdgeDuplicate.duplicate_facts/contradicted_facts
+            # and crash a 56-ticker cold-start. `_make_retrying_llm` additionally re-requests any
+            # response that fails schema validation (json_schema here is non-strict), so a single
+            # dropped-field response can't kill a multi-thousand-edge build. Override the mode via
+            # GRAPHITI_STRUCTURED for a provider without json_schema support.
+            llm = _make_retrying_llm(
+                LLMConfig(api_key=self.api_key, model=self.model,
+                          small_model=self.small_model, base_url=self.base_url),
+                _structured_mode())
             # cross_encoder MUST be passed: Graphiti's default is an OpenAIRerankerClient that reads
             # OPENAI_API_KEY at construction, which we don't set (we run on OpenRouter). Default to a
             # free passthrough reranker (no key/model/network); GRAPHITI_RERANKER=openai opts into the
@@ -395,6 +456,29 @@ def _entity_node():
 def _entity_edge():
     from graphiti_core.edges import EntityEdge
     return EntityEdge
+
+
+def _make_retrying_llm(config, structured_output_mode):
+    """graphiti ``OpenAIGenericClient`` that validates each structured response against its response
+    model and re-requests on a schema miss (see :func:`_generate_validated`).
+
+    Defined lazily so this module imports without ``graphiti_core`` present, matching the other
+    ``_make_*`` factories. graphiti's own client returns the parsed dict unvalidated and does not
+    re-prompt on a ``ValidationError``; wrapping ``generate_response`` restores the robustness Zep's
+    managed service provided, using the same model and no new credential.
+    """
+    from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
+
+    attempts = _validation_retries()
+
+    class _RetryingGenericClient(OpenAIGenericClient):
+        async def generate_response(self, messages, response_model=None, **kwargs):
+            async def _once():
+                return await OpenAIGenericClient.generate_response(
+                    self, messages, response_model=response_model, **kwargs)
+            return await _generate_validated(_once, response_model, attempts)
+
+    return _RetryingGenericClient(config=config, structured_output_mode=structured_output_mode)
 
 
 def _make_passthrough_reranker():
