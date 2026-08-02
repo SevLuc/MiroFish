@@ -44,6 +44,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -175,16 +176,26 @@ class GraphitiBackend:
             raise ValueError("no extraction key: set LLM_API_KEY (OpenRouter) or OPENAI_API_KEY")
         self._graphiti = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
         self._indices_built = False
 
     # -- lifecycle -------------------------------------------------------- #
     def _loop_get(self) -> asyncio.AbstractEventLoop:
+        # Run graphiti's async ops on a dedicated background thread + loop. MiroFish calls the backend
+        # from sync code that is sometimes already inside a running event loop (persona enrichment,
+        # sim search); `run_until_complete` on the *current* thread raises "This event loop is already
+        # running" there. Submitting to a separate always-running loop (via run_coroutine_threadsafe
+        # in `_run`) is safe from any calling context, and keeps every graphiti/FalkorDB async
+        # resource bound to one consistent loop for the backend's lifetime.
         if self._loop is None or self._loop.is_closed():
             self._loop = asyncio.new_event_loop()
+            self._thread = threading.Thread(
+                target=self._loop.run_forever, name="graphiti-loop", daemon=True)
+            self._thread.start()
         return self._loop
 
     def _run(self, coro):
-        return self._loop_get().run_until_complete(coro)
+        return asyncio.run_coroutine_threadsafe(coro, self._loop_get()).result()
 
     def _client(self):
         """Lazily build the Graphiti client bound to FalkorDB, the extraction LLM, and an embedder."""
@@ -257,6 +268,9 @@ class GraphitiBackend:
             except Exception:  # best-effort — the process is about to exit anyway
                 logger.debug("graphiti close() failed", exc_info=True)
         if self._loop and not self._loop.is_closed():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            if self._thread:
+                self._thread.join(timeout=5)
             self._loop.close()
 
     # -- build / append --------------------------------------------------- #
@@ -330,6 +344,25 @@ class GraphitiBackend:
             "invalid_at": _iso(e.invalid_at),
             "expired_at": _iso(e.expired_at),
         } for e in self._all(_entity_edge(), cluster)]
+
+    def get_node(self, uuid: str) -> Optional[dict]:
+        """One node by uuid (backs ``zep_tools.get_node_detail``, which has no cluster/group_id).
+
+        Returns the same node dict shape as :meth:`get_all_nodes`, or ``None`` if not found —
+        Graphiti raises when a uuid is missing, which for a *detail* lookup is "no such node"."""
+        try:
+            n = self._run(_entity_node().get_by_uuid(self._client().driver, uuid))
+        except Exception:
+            return None
+        if not n:
+            return None
+        return {
+            "uuid": n.uuid,
+            "name": n.name or "",
+            "labels": list(n.labels or []),
+            "summary": n.summary or "",
+            "attributes": dict(n.attributes or {}),
+        }
 
     # -- search (simulation-time) ----------------------------------------- #
     def search_graph(self, cluster: str, query: str, *, limit: int = 10) -> dict:

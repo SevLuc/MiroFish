@@ -788,7 +788,14 @@ class ZepToolsService:
             节点信息或None
         """
         logger.info(t("console.fetchingNodeDetail", uuid=node_uuid[:8]))
-        
+
+        if use_graphiti():
+            n = get_graphiti_backend().get_node(node_uuid)
+            if not n:
+                return None
+            return NodeInfo(uuid=n["uuid"], name=n["name"], labels=n["labels"],
+                            summary=n["summary"], attributes=n["attributes"])
+
         try:
             node = self._call_with_retry(
                 func=lambda: self.client.graph.node.get(uuid_=node_uuid),
