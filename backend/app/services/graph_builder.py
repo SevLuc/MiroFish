@@ -22,6 +22,7 @@ from ..utils.ontology import (
     normalize_ontology_source_targets,
 )
 from ..utils.zep import (
+    ZEP_BATCH_POLL_INTERVAL_SECONDS,
     ZEP_INGESTION_WAIT_TIMEOUT_SECONDS,
     call_zep_read_with_retry,
     get_zep_client,
@@ -743,7 +744,7 @@ class GraphBuilderService:
 
             if status in terminal_states:
                 break
-            time.sleep(3)
+            time.sleep(ZEP_BATCH_POLL_INTERVAL_SECONDS)
 
         items = self._list_batch_items(submission.batch_id)
         if status != "succeeded":
@@ -844,7 +845,7 @@ class GraphBuilderService:
                 )
             
             if pending_episodes:
-                time.sleep(3)  # 每3秒检查一次
+                time.sleep(ZEP_BATCH_POLL_INTERVAL_SECONDS)  # rate-limit-friendly poll cadence
         
         if progress_callback:
             progress_callback(t('progress.processingComplete', completed=completed_count, total=total_episodes), 1.0)

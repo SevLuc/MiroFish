@@ -24,6 +24,37 @@ def test_permanent_zep_errors_fail_without_retry():
     assert len(calls) == 1
 
 
+def test_non_json_error_body_is_retried_not_fatal():
+    """A throttled/5xx response can carry a non-JSON body; the SDK's Response.json() then raises
+    JSONDecodeError instead of a ZepApiError. On a read that is a transient error and must retry,
+    not kill a long-running ingest."""
+    import json
+
+    calls = []
+
+    def operation():
+        calls.append(True)
+        if len(calls) < 3:
+            raise json.JSONDecodeError("Expecting value", "", 0)
+        return "ok"
+
+    result = zep.call_zep_read_with_retry(
+        operation,
+        operation_name="non-json 429 body",
+        max_attempts=5,
+        sleep=lambda _seconds: None,
+    )
+
+    assert result == "ok"
+    assert len(calls) == 3
+    assert zep.is_retryable_zep_error(json.JSONDecodeError("x", "", 0)) is True
+
+
+def test_batch_poll_interval_default_is_rate_limit_friendly():
+    # 3s hammered Zep's batch API for a large ingest (429, x-ratelimit-limit=5); default is now 30s.
+    assert zep.ZEP_BATCH_POLL_INTERVAL_SECONDS == 30
+
+
 def test_rate_limit_retry_respects_retry_after():
     calls = []
     sleeps = []
