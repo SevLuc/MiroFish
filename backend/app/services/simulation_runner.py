@@ -1790,6 +1790,12 @@ class SimulationRunner:
 
         ipc_client = SimulationIPCClient(sim_dir)
 
+        # An interview IS the client actively using the sim — count it as a heartbeat so the
+        # dead-man's-switch doesn't reap the OASIS env mid-report. Without this the report agent
+        # (which interviews AFTER the pipeline stops polling run-status) races the heartbeat
+        # timeout and finds a dead env ("interview tool couldn't connect").
+        cls.note_client_poll(simulation_id)
+
         if not ipc_client.check_env_alive():
             raise ValueError(f"模拟环境未运行或已关闭，无法执行Interview: {simulation_id}")
 
@@ -1851,6 +1857,10 @@ class SimulationRunner:
             raise ValueError(f"模拟不存在: {simulation_id}")
 
         ipc_client = SimulationIPCClient(sim_dir)
+
+        # An interview IS the client actively using the sim — count it as a heartbeat so the
+        # dead-man's-switch doesn't reap the OASIS env mid-report (see interview_agent above).
+        cls.note_client_poll(simulation_id)
 
         if not ipc_client.check_env_alive():
             raise ValueError(f"模拟环境未运行或已关闭，无法执行Interview: {simulation_id}")
