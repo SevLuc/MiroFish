@@ -27,6 +27,25 @@ from ..models.project import ProjectManager
 logger = get_logger('mirofish.api.simulation')
 
 
+def _resolve_profile_parallel_count(requested) -> int:
+    """How many personas to generate concurrently in ``prepare``.
+
+    Persona generation runs a ``ThreadPoolExecutor`` (``oasis_profile_generator``); each agent's
+    generation is an independent LLM call, so the stage is LLM-latency-bound and higher concurrency
+    cuts the ``prepare`` wall-clock roughly linearly until the provider rate-limits (it doesn't, at
+    this scale). ``prepare`` was ~20 min of a ~34 min daily run at the old default of 5.
+
+    Precedence: an explicit request value wins; otherwise ``PROFILE_PARALLEL_COUNT`` from the env
+    (so a batch/worker deployment can tune it without a code change); otherwise 8 (raised from 5).
+    """
+    if requested:
+        return int(requested)
+    try:
+        return max(1, int(os.environ.get("PROFILE_PARALLEL_COUNT", "8") or "8"))
+    except (TypeError, ValueError):
+        return 8
+
+
 def _get_default_platform(simulation_id: str) -> str:
     """
     根据模拟配置返回默认平台
@@ -496,7 +515,8 @@ def prepare_simulation():
         
         entity_types_list = data.get('entity_types')
         use_llm_for_profiles = data.get('use_llm_for_profiles', True)
-        parallel_profile_count = data.get('parallel_profile_count', 5)
+        parallel_profile_count = _resolve_profile_parallel_count(
+            data.get('parallel_profile_count'))
         
         # ========== 同步获取实体数量（在后台任务启动前） ==========
         # 这样前端在调用prepare后立即就能获取到预期Agent总数
