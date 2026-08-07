@@ -27,6 +27,25 @@ from ..utils.zep_lifecycle import (
 logger = get_logger('mirofish.api.report')
 
 
+def _rounds_complete_alive(run_state) -> bool:
+    """True when the sim has finished all its rounds but is still ALIVE in its
+    wait-for-commands loop (``RunnerStatus.RUNNING`` at 100%).
+
+    The OASIS process stays up after the last round to serve interview commands
+    over IPC; only ``/stop`` or ``/close-env`` ends it (and ``/stop`` *kills* the
+    env). A report generated in this window can therefore reach the live agents
+    via ``interview_agents`` — the whole point of reporting BEFORE closing the
+    env (see the trade-gpt ``microfish_pipeline`` reorder). This is distinct from
+    a *mid-run* RUNNING sim: ``_check_all_platforms_completed`` is False until
+    every enabled platform has finished, so a half-finished sim is still rejected.
+    """
+    return (
+        run_state is not None
+        and run_state.runner_status == RunnerStatus.RUNNING
+        and SimulationRunner._check_all_platforms_completed(run_state)
+    )
+
+
 # ============== 报告生成接口 ==============
 
 @report_bp.route('/generate', methods=['POST'])
@@ -89,8 +108,14 @@ def generate_report():
             RunnerStatus.PAUSED,
             RunnerStatus.STOPPING,
         }
+        # A sim whose rounds are done but is still alive in wait-for-commands is
+        # RUNNING, yet reportable: interviews need that live env (see helper). So it
+        # is NOT treated as "active", and it satisfies the terminal requirement.
+        rounds_complete_alive = _rounds_complete_alive(run_state)
         if updater is not None or (
-            run_state is not None and run_state.runner_status in active_statuses
+            run_state is not None
+            and run_state.runner_status in active_statuses
+            and not rounds_complete_alive
         ):
             return jsonify({
                 "success": False,
@@ -104,9 +129,9 @@ def generate_report():
             RunnerStatus.COMPLETED,
             RunnerStatus.STOPPED,
         }
-        if (
-            run_state is None
-            or run_state.runner_status not in successful_terminal_statuses
+        if run_state is None or (
+            run_state.runner_status not in successful_terminal_statuses
+            and not rounds_complete_alive
         ):
             return jsonify({
                 "success": False,
@@ -183,9 +208,13 @@ def generate_report():
                     "success": False,
                     "error": "The project graph changed while reporting was starting",
                 }), 409
+            refreshed_rounds_complete_alive = _rounds_complete_alive(
+                refreshed_run_state
+            )
             if refreshed_updater is not None or (
                 refreshed_run_state is not None
                 and refreshed_run_state.runner_status in active_statuses
+                and not refreshed_rounds_complete_alive
             ):
                 return jsonify({
                     "success": False,
@@ -195,10 +224,10 @@ def generate_report():
                     ),
                     "ingestion_pending": refreshed_updater is not None,
                 }), 409
-            if (
-                refreshed_run_state is None
-                or refreshed_run_state.runner_status
+            if refreshed_run_state is None or (
+                refreshed_run_state.runner_status
                 not in successful_terminal_statuses
+                and not refreshed_rounds_complete_alive
             ):
                 return jsonify({
                     "success": False,
