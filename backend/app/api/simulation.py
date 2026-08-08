@@ -2902,8 +2902,8 @@ def close_simulation_env():
         }), 500
 
 
-@simulation_bp.route('/<simulation_id>/posts', methods=['GET'])
-def get_simulation_posts(simulation_id: str):
+@simulation_bp.route('/<simulation_id>/raw-posts', methods=['GET'])
+def get_simulation_raw_posts(simulation_id: str):
     """返回一次已完成模拟的原始帖子语料（两个平台、所有轮次）。
 
     Return the raw content-bearing posts (both platforms, all rounds, each with ``created_at``) a
