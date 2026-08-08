@@ -2900,3 +2900,24 @@ def close_simulation_env():
             "error": str(e),
             "traceback": traceback.format_exc()
         }), 500
+
+
+@simulation_bp.route('/<simulation_id>/posts', methods=['GET'])
+def get_simulation_posts(simulation_id: str):
+    """返回一次已完成模拟的原始帖子语料（两个平台、所有轮次）。
+
+    Return the raw content-bearing posts (both platforms, all rounds, each with ``created_at``) a
+    finished simulation wrote to its ``trace`` DBs — so a caller can score the crowd from the actual
+    posts rather than the report narrative. Best-effort: a missing sim dir is a 404; a missing or
+    unreadable platform DB simply contributes no rows.
+    """
+    from ..services.trace_posts import read_trace_posts
+
+    sim_dir = os.path.join(Config.OASIS_SIMULATION_DATA_DIR, simulation_id)
+    if not os.path.exists(sim_dir):
+        return jsonify({
+            "success": False,
+            "error": t('api.simulationNotFound', id=simulation_id),
+        }), 404
+    posts = read_trace_posts(sim_dir)
+    return jsonify({"success": True, "data": {"posts": posts, "count": len(posts)}})
