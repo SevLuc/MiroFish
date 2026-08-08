@@ -274,10 +274,15 @@ class GraphitiBackend:
             # response that fails schema validation (json_schema here is non-strict), so a single
             # dropped-field response can't kill a multi-thousand-edge build. Override the mode via
             # GRAPHITI_STRUCTURED for a provider without json_schema support.
+            mode = _structured_mode()
+            # GRAPHITI_STRUCTURED=json_schema_strict: for gpt-5 / strict models, patch the schema to
+            # OpenAI's strict subset (additionalProperties:false + all-required) and set strict:true,
+            # so the provider GUARANTEES the shape. Base mode stays json_schema for graphiti's client.
+            strict = mode == "json_schema_strict"
             llm = _make_retrying_llm(
                 LLMConfig(api_key=self.api_key, model=self.model,
                           small_model=self.small_model, base_url=self.base_url),
-                _structured_mode())
+                "json_schema" if strict else mode, strict=strict)
             # cross_encoder MUST be passed: Graphiti's default is an OpenAIRerankerClient that reads
             # OPENAI_API_KEY at construction, which we don't set (we run on OpenRouter). Default to a
             # free passthrough reranker (no key/model/network); GRAPHITI_RERANKER=openai opts into the
@@ -458,9 +463,15 @@ def _entity_edge():
     return EntityEdge
 
 
-def _make_retrying_llm(config, structured_output_mode):
+def _make_retrying_llm(config, structured_output_mode, strict=False):
     """graphiti ``OpenAIGenericClient`` that validates each structured response against its response
     model and re-requests on a schema miss (see :func:`_generate_validated`).
+
+    With ``strict=True`` it also patches the ``json_schema`` response_format to OpenAI's strict
+    subset (``make_strict_schema`` + ``"strict": true``) so gpt-5 / strict models accept it and
+    GUARANTEE the shape — graphiti's raw ``model_json_schema()`` is otherwise rejected with
+    ``400 invalid_json_schema``. On strict models the guarantee makes the retry net a rarely-used
+    backstop rather than the primary defence.
 
     Defined lazily so this module imports without ``graphiti_core`` present, matching the other
     ``_make_*`` factories. graphiti's own client returns the parsed dict unvalidated and does not
@@ -468,10 +479,21 @@ def _make_retrying_llm(config, structured_output_mode):
     managed service provided, using the same model and no new credential.
     """
     from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
+    from .strict_schema import make_strict_schema
 
     attempts = _validation_retries()
 
     class _RetryingGenericClient(OpenAIGenericClient):
+        def _build_response_format(self, response_model):
+            rf = super()._build_response_format(response_model)
+            if strict and isinstance(rf, dict) and rf.get("type") == "json_schema":
+                js = rf.get("json_schema") or {}
+                if isinstance(js.get("schema"), dict):
+                    js["schema"] = make_strict_schema(js["schema"])
+                    js["strict"] = True
+                    rf["json_schema"] = js
+            return rf
+
         async def generate_response(self, messages, response_model=None, **kwargs):
             async def _once():
                 return await OpenAIGenericClient.generate_response(
