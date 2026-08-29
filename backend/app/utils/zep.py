@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from functools import lru_cache
@@ -25,7 +26,21 @@ ZEP_CLOUD_BASE_URL = "https://api.getzep.com/api/v2"
 ZEP_HTTP_REQUEST_TIMEOUT_SECONDS = 60.0
 # Zep ingestion is asynchronous and may take several minutes. Preserve the
 # original GraphBuilder deadline while keeping it separate from HTTP timeout.
-ZEP_INGESTION_WAIT_TIMEOUT_SECONDS = 600
+# Overridable via env so a large cold-start ingest (e.g. a 60-90 day, many-name
+# cluster graph) can wait longer than the historical 600s default, which is a
+# poll-patience ceiling rather than a Zep-imposed limit — ingestion keeps running
+# regardless, we just stop waiting. Default preserves prior behaviour.
+ZEP_INGESTION_WAIT_TIMEOUT_SECONDS = int(
+    os.environ.get("ZEP_INGESTION_WAIT_TIMEOUT_SECONDS", "600")
+)
+# How long to sleep between Zep batch/episode status polls. The historical 3s is fine for a small
+# graph but hammers Zep's batch API for a large cold-start ingest (thousands of episodes polled to
+# completion), tripping the account's request rate limit (observed: HTTP 429, x-ratelimit-limit=5).
+# Env-overridable and defaulted higher so a big ingest stays well under a low free-tier rate cap;
+# ingestion is asynchronous, so a slower poll only changes when we notice completion, not throughput.
+ZEP_BATCH_POLL_INTERVAL_SECONDS = int(
+    os.environ.get("ZEP_BATCH_POLL_INTERVAL_SECONDS", "30")
+)
 MAX_ZEP_SEARCH_QUERY_CHARS = 400
 MAX_ZEP_SEARCH_RESULTS = 50
 
@@ -101,6 +116,13 @@ def is_retryable_zep_error(error: BaseException) -> bool:
         return status_code in {408, 429} or (
             status_code is not None and 500 <= status_code <= 599
         )
+    # A throttled/5xx response can carry a NON-JSON body (e.g. a plain-text 429 from the rate
+    # limiter). The zep_cloud SDK calls Response.json() unconditionally, so that surfaces as a
+    # JSONDecodeError rather than a ZepApiError — losing the status code entirely. On a *read* that
+    # almost always means a transient error body, so retry it (with plain backoff, since there is no
+    # Retry-After to honour here). Without this, a single throttle mid-poll kills a long ingest.
+    if isinstance(error, json.JSONDecodeError):
+        return True
     return False
 
 
