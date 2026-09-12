@@ -1528,9 +1528,16 @@ def start_simulation():
             "simulation_id": "sim_xxxx",          // 必填，模拟ID
             "platform": "parallel",                // 可选: twitter / reddit / parallel (默认)
             "max_rounds": 100,                     // 可选: 最大模拟轮数，用于截断过长的模拟
+            "start_hour": 9,                       // 可选: 模拟时钟起始小时 0-23（默认 0）
+            "ignore_active_hours": false,          // 可选: 每轮所有 Agent 均可被激活，不按 active_hours 过滤
             "enable_graph_memory_update": false,   // 可选: 是否将Agent活动动态更新到Zep图谱记忆
             "force": false                         // 可选: 强制重新开始（会停止运行中的模拟并清理日志）
         }
+
+    关于 start_hour / ignore_active_hours：
+        - 模拟时钟默认从 00:00 开始，Agent 只在各自的 active_hours 内被激活；截断到很少的轮数
+          （如 max_rounds=7、每轮 60 分钟）时整段模拟落在 00:00-06:00，几乎没有 Agent 活跃。
+        - start_hour 把时钟起点移到指定小时；ignore_active_hours 则完全不按时钟过滤。
 
     关于 force 参数：
         - 启用后，如果模拟正在运行或已完成，会先停止并清理运行日志
@@ -1573,6 +1580,8 @@ def start_simulation():
         max_rounds = data.get('max_rounds')  # 可选：最大模拟轮数
         enable_graph_memory_update = data.get('enable_graph_memory_update', False)  # 可选：是否启用图谱记忆更新
         force = data.get('force', False)  # 可选：强制重新开始
+        start_hour = data.get('start_hour')  # 可选：模拟时钟起始小时 0-23
+        ignore_active_hours = data.get('ignore_active_hours', False)  # 可选：不按模拟时钟过滤 Agent
         if not isinstance(enable_graph_memory_update, bool):
             return jsonify({
                 "success": False,
@@ -1583,6 +1592,17 @@ def start_simulation():
                 "success": False,
                 "error": "force must be a JSON boolean",
             }), 400
+        if not isinstance(ignore_active_hours, bool):
+            return jsonify({
+                "success": False,
+                "error": "ignore_active_hours must be a JSON boolean",
+            }), 400
+        if start_hour is not None:
+            if isinstance(start_hour, bool) or not isinstance(start_hour, int) or not 0 <= start_hour <= 23:
+                return jsonify({
+                    "success": False,
+                    "error": "start_hour must be an integer in 0..23",
+                }), 400
 
         # 验证 max_rounds 参数
         if max_rounds is not None:
@@ -1774,12 +1794,17 @@ def start_simulation():
                 platform=platform,
                 max_rounds=max_rounds,
                 enable_graph_memory_update=enable_graph_memory_update,
-                graph_id=graph_id
+                graph_id=graph_id,
+                start_hour=start_hour,
+                ignore_active_hours=ignore_active_hours
             )
-        
+
         response_data = run_state.to_dict()
         if max_rounds:
             response_data['max_rounds_applied'] = max_rounds
+        if start_hour is not None:
+            response_data['start_hour_applied'] = start_hour
+        response_data['ignore_active_hours'] = ignore_active_hours
         response_data['graph_memory_update_enabled'] = enable_graph_memory_update
         response_data['force_restarted'] = force_restarted
         if enable_graph_memory_update:
