@@ -89,6 +89,12 @@ _project_root = os.path.abspath(os.path.join(_backend_dir, '..'))
 sys.path.insert(0, _scripts_dir)
 sys.path.insert(0, _backend_dir)
 
+from sim_clock import activity_multiplier, eligible_agent_ids, simulated_clock
+
+#: Short (capped) runs log every round's clock / active-agent / action counts; long runs keep the
+#: every-20-rounds progress line. Without this a 7-round run that wakes nobody is invisible.
+ROUND_LOG_EVERY_ROUND_MAX = 24
+
 # 加载项目根目录的 .env 文件（包含 LLM_API_KEY 等配置）
 from dotenv import load_dotenv
 _env_file = os.path.join(_project_root, '.env')
@@ -1041,39 +1047,27 @@ def get_active_agents_for_round(
     env,
     config: Dict[str, Any],
     current_hour: int,
-    round_num: int
+    round_num: int,
+    ignore_active_hours: bool = False
 ) -> List:
-    """根据时间和配置决定本轮激活哪些Agent"""
+    """根据时间和配置决定本轮激活哪些Agent
+
+    ignore_active_hours=True 时不按模拟时钟过滤 Agent：每轮所有 Agent 都可被激活（仍受
+    activity_level 与每轮目标数量限制，高峰/低谷倍率固定为 1.0）。用于短的截断模拟
+    （如 --max-rounds 7）：否则整段模拟落在 00:00-06:00，几乎没有 Agent 处于活跃时段，
+    模拟结束时 total_actions 等于初始帖子数。见 sim_clock.py。
+    """
     time_config = config.get("time_config", {})
     agent_configs = config.get("agent_configs", [])
-    
+
     base_min = time_config.get("agents_per_hour_min", 5)
     base_max = time_config.get("agents_per_hour_max", 20)
-    
-    peak_hours = time_config.get("peak_hours", [9, 10, 11, 14, 15, 20, 21, 22])
-    off_peak_hours = time_config.get("off_peak_hours", [0, 1, 2, 3, 4, 5])
-    
-    if current_hour in peak_hours:
-        multiplier = time_config.get("peak_activity_multiplier", 1.5)
-    elif current_hour in off_peak_hours:
-        multiplier = time_config.get("off_peak_activity_multiplier", 0.3)
-    else:
-        multiplier = 1.0
-    
+
+    multiplier = activity_multiplier(time_config, current_hour, ignore_active_hours)
     target_count = int(random.uniform(base_min, base_max) * multiplier)
-    
-    candidates = []
-    for cfg in agent_configs:
-        agent_id = cfg.get("agent_id", 0)
-        active_hours = cfg.get("active_hours", list(range(8, 23)))
-        activity_level = cfg.get("activity_level", 0.5)
-        
-        if current_hour not in active_hours:
-            continue
-        
-        if random.random() < activity_level:
-            candidates.append(agent_id)
-    
+
+    candidates = eligible_agent_ids(agent_configs, current_hour, ignore_active_hours)
+
     selected_ids = random.sample(
         candidates, 
         min(target_count, len(candidates))
@@ -1099,11 +1093,13 @@ class PlatformSimulation:
 
 
 async def run_twitter_simulation(
-    config: Dict[str, Any], 
+    config: Dict[str, Any],
     simulation_dir: str,
     action_logger: Optional[PlatformActionLogger] = None,
     main_logger: Optional[SimulationLogManager] = None,
-    max_rounds: Optional[int] = None
+    max_rounds: Optional[int] = None,
+    start_hour: int = 0,
+    ignore_active_hours: bool = False
 ) -> PlatformSimulation:
     """运行Twitter模拟
     
@@ -1174,7 +1170,7 @@ async def run_twitter_simulation(
     
     # 记录 round 0 开始（初始事件阶段）
     if action_logger:
-        action_logger.log_round_start(0, 0)  # round 0, simulated_hour 0
+        action_logger.log_round_start(0, int(start_hour) % 24)  # round 0 runs at the clock's start hour
     
     initial_action_count = 0
     if initial_posts:
@@ -1232,22 +1228,24 @@ async def run_twitter_simulation(
                 main_logger.info(f"收到退出信号，在第 {round_num + 1} 轮停止模拟")
             break
         
-        simulated_minutes = round_num * minutes_per_round
-        simulated_hour = (simulated_minutes // 60) % 24
-        simulated_day = simulated_minutes // (60 * 24) + 1
-        
+        simulated_hour, simulated_day = simulated_clock(round_num, minutes_per_round, start_hour)
+
         active_agents = get_active_agents_for_round(
-            result.env, config, simulated_hour, round_num
+            result.env, config, simulated_hour, round_num,
+            ignore_active_hours=ignore_active_hours
         )
-        
+
         # 无论是否有活跃agent，都记录round开始
         if action_logger:
             action_logger.log_round_start(round_num + 1, simulated_hour)
-        
+
         if not active_agents:
             # 没有活跃agent时也记录round结束（actions_count=0）
             if action_logger:
                 action_logger.log_round_end(round_num + 1, 0)
+            if total_rounds <= ROUND_LOG_EVERY_ROUND_MAX:
+                log_info(f"Round {round_num + 1}/{total_rounds}: day {simulated_day} "
+                         f"{simulated_hour:02d}:00, active agents 0, actions 0")
             continue
         
         actions = {agent: LLMAction() for _, agent in active_agents}
@@ -1274,7 +1272,11 @@ async def run_twitter_simulation(
         if action_logger:
             action_logger.log_round_end(round_num + 1, round_action_count)
         
-        if (round_num + 1) % 20 == 0:
+        if total_rounds <= ROUND_LOG_EVERY_ROUND_MAX:
+            log_info(f"Round {round_num + 1}/{total_rounds}: day {simulated_day} "
+                     f"{simulated_hour:02d}:00, active agents {len(active_agents)}, "
+                     f"actions {round_action_count}")
+        elif (round_num + 1) % 20 == 0:
             progress = (round_num + 1) / total_rounds * 100
             log_info(f"Day {simulated_day}, {simulated_hour:02d}:00 - Round {round_num + 1}/{total_rounds} ({progress:.1f}%)")
     
@@ -1291,11 +1293,13 @@ async def run_twitter_simulation(
 
 
 async def run_reddit_simulation(
-    config: Dict[str, Any], 
+    config: Dict[str, Any],
     simulation_dir: str,
     action_logger: Optional[PlatformActionLogger] = None,
     main_logger: Optional[SimulationLogManager] = None,
-    max_rounds: Optional[int] = None
+    max_rounds: Optional[int] = None,
+    start_hour: int = 0,
+    ignore_active_hours: bool = False
 ) -> PlatformSimulation:
     """运行Reddit模拟
     
@@ -1365,7 +1369,7 @@ async def run_reddit_simulation(
     
     # 记录 round 0 开始（初始事件阶段）
     if action_logger:
-        action_logger.log_round_start(0, 0)  # round 0, simulated_hour 0
+        action_logger.log_round_start(0, int(start_hour) % 24)  # round 0 runs at the clock's start hour
     
     initial_action_count = 0
     if initial_posts:
@@ -1431,22 +1435,24 @@ async def run_reddit_simulation(
                 main_logger.info(f"收到退出信号，在第 {round_num + 1} 轮停止模拟")
             break
         
-        simulated_minutes = round_num * minutes_per_round
-        simulated_hour = (simulated_minutes // 60) % 24
-        simulated_day = simulated_minutes // (60 * 24) + 1
-        
+        simulated_hour, simulated_day = simulated_clock(round_num, minutes_per_round, start_hour)
+
         active_agents = get_active_agents_for_round(
-            result.env, config, simulated_hour, round_num
+            result.env, config, simulated_hour, round_num,
+            ignore_active_hours=ignore_active_hours
         )
-        
+
         # 无论是否有活跃agent，都记录round开始
         if action_logger:
             action_logger.log_round_start(round_num + 1, simulated_hour)
-        
+
         if not active_agents:
             # 没有活跃agent时也记录round结束（actions_count=0）
             if action_logger:
                 action_logger.log_round_end(round_num + 1, 0)
+            if total_rounds <= ROUND_LOG_EVERY_ROUND_MAX:
+                log_info(f"Round {round_num + 1}/{total_rounds}: day {simulated_day} "
+                         f"{simulated_hour:02d}:00, active agents 0, actions 0")
             continue
         
         actions = {agent: LLMAction() for _, agent in active_agents}
@@ -1473,7 +1479,11 @@ async def run_reddit_simulation(
         if action_logger:
             action_logger.log_round_end(round_num + 1, round_action_count)
         
-        if (round_num + 1) % 20 == 0:
+        if total_rounds <= ROUND_LOG_EVERY_ROUND_MAX:
+            log_info(f"Round {round_num + 1}/{total_rounds}: day {simulated_day} "
+                     f"{simulated_hour:02d}:00, active agents {len(active_agents)}, "
+                     f"actions {round_action_count}")
+        elif (round_num + 1) % 20 == 0:
             progress = (round_num + 1) / total_rounds * 100
             log_info(f"Day {simulated_day}, {simulated_hour:02d}:00 - Round {round_num + 1}/{total_rounds} ({progress:.1f}%)")
     
@@ -1512,6 +1522,18 @@ async def main():
         type=int,
         default=None,
         help='最大模拟轮数（可选，用于截断过长的模拟）'
+    )
+    parser.add_argument(
+        '--start-hour',
+        type=int,
+        default=0,
+        help='模拟时钟起始小时 0-23（默认 0，即从 00:00 开始；截断到 7 轮时建议 9，覆盖 09:00-15:00）'
+    )
+    parser.add_argument(
+        '--ignore-active-hours',
+        action='store_true',
+        default=False,
+        help='不按模拟时钟过滤 Agent：每轮所有 Agent 均可被激活（仍受 activity_level 限制）'
     )
     parser.add_argument(
         '--no-wait',
@@ -1563,7 +1585,13 @@ async def main():
         if args.max_rounds < config_total_rounds:
             log_manager.info(f"  - 实际执行轮数: {args.max_rounds} (已截断)")
     log_manager.info(f"  - Agent数量: {len(config.get('agent_configs', []))}")
-    
+    start_hour = int(args.start_hour) % 24
+    ignore_active_hours = bool(args.ignore_active_hours)
+    log_manager.info(f"  - 模拟时钟起始: {start_hour:02d}:00 (start_hour={start_hour})")
+    log_manager.info(f"  - 忽略活跃时段: {'是' if ignore_active_hours else '否'} (ignore_active_hours)")
+    log_manager.info(f"  - 高峰时段: {time_config.get('peak_hours')}  低谷时段: {time_config.get('off_peak_hours')}")
+    log_manager.info(f"  - 每轮激活目标: {time_config.get('agents_per_hour_min')}-{time_config.get('agents_per_hour_max')}")
+
     log_manager.info("日志结构:")
     log_manager.info(f"  - 主日志: simulation.log")
     log_manager.info(f"  - Twitter动作: twitter/actions.jsonl")
@@ -1577,14 +1605,18 @@ async def main():
     reddit_result: Optional[PlatformSimulation] = None
     
     if args.twitter_only:
-        twitter_result = await run_twitter_simulation(config, simulation_dir, twitter_logger, log_manager, args.max_rounds)
+        twitter_result = await run_twitter_simulation(config, simulation_dir, twitter_logger, log_manager, args.max_rounds,
+                                   start_hour=start_hour, ignore_active_hours=ignore_active_hours)
     elif args.reddit_only:
-        reddit_result = await run_reddit_simulation(config, simulation_dir, reddit_logger, log_manager, args.max_rounds)
+        reddit_result = await run_reddit_simulation(config, simulation_dir, reddit_logger, log_manager, args.max_rounds,
+                                  start_hour=start_hour, ignore_active_hours=ignore_active_hours)
     else:
         # 并行运行（每个平台使用独立的日志记录器）
         results = await asyncio.gather(
-            run_twitter_simulation(config, simulation_dir, twitter_logger, log_manager, args.max_rounds),
-            run_reddit_simulation(config, simulation_dir, reddit_logger, log_manager, args.max_rounds),
+            run_twitter_simulation(config, simulation_dir, twitter_logger, log_manager, args.max_rounds,
+                                   start_hour=start_hour, ignore_active_hours=ignore_active_hours),
+            run_reddit_simulation(config, simulation_dir, reddit_logger, log_manager, args.max_rounds,
+                                  start_hour=start_hour, ignore_active_hours=ignore_active_hours),
         )
         twitter_result, reddit_result = results
     

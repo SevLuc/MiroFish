@@ -407,17 +407,21 @@ class SimulationRunner:
         platform: str = "parallel",  # twitter / reddit / parallel
         max_rounds: int = None,  # 最大模拟轮数（可选，用于截断过长的模拟）
         enable_graph_memory_update: bool = False,  # 是否将活动更新到Zep图谱
-        graph_id: str = None  # Zep图谱ID（启用图谱更新时必需）
+        graph_id: str = None,  # Zep图谱ID（启用图谱更新时必需）
+        start_hour: int = None,  # 模拟时钟起始小时 0-23（可选，默认 0）
+        ignore_active_hours: bool = False  # 不按模拟时钟过滤 Agent（可选）
     ) -> SimulationRunState:
         """
         启动模拟
-        
+
         Args:
             simulation_id: 模拟ID
             platform: 运行平台 (twitter/reddit/parallel)
             max_rounds: 最大模拟轮数（可选，用于截断过长的模拟）
             enable_graph_memory_update: 是否将Agent活动动态更新到Zep图谱
             graph_id: Zep图谱ID（启用图谱更新时必需）
+            start_hour: 模拟时钟起始小时（可选；截断到几轮时用它把轮次放进活跃时段）
+            ignore_active_hours: 每轮所有 Agent 均可被激活，不按 active_hours 过滤（可选）
             
         Returns:
             SimulationRunState
@@ -556,6 +560,12 @@ class SimulationRunner:
             # 如果指定了最大轮数，添加到命令行参数
             if max_rounds is not None and max_rounds > 0:
                 cmd.extend(["--max-rounds", str(max_rounds)])
+
+            # 模拟时钟：起始小时 / 忽略活跃时段（见 scripts/sim_clock.py）
+            if start_hour is not None:
+                cmd.extend(["--start-hour", str(int(start_hour))])
+            if ignore_active_hours:
+                cmd.append("--ignore-active-hours")
             
             # 创建主日志文件，避免 stdout/stderr 管道缓冲区满导致进程阻塞
             main_log_path = os.path.join(sim_dir, "simulation.log")
