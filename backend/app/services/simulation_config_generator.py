@@ -177,7 +177,9 @@ class SimulationParameters:
     # 生成元数据
     generated_at: str = field(default_factory=lambda: datetime.now().isoformat())
     generation_reasoning: str = ""  # LLM的推理说明
-    
+    # 降级警告（如：初始帖子因 LLM 输出截断而部分丢弃）。空列表 = 正常。
+    warnings: List[str] = field(default_factory=list)
+
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
         time_dict = asdict(self.time_config)
@@ -195,6 +197,7 @@ class SimulationParameters:
             "llm_base_url": self.llm_base_url,
             "generated_at": self.generated_at,
             "generation_reasoning": self.generation_reasoning,
+            "warnings": list(self.warnings),
         }
     
     def to_json(self, indent: int = 2) -> str:
@@ -202,10 +205,19 @@ class SimulationParameters:
         return json.dumps(self.to_dict(), ensure_ascii=False, indent=indent)
 
 
+class LLMOutputShapeError(ValueError):
+    """The LLM returned parseable JSON whose shape failed the caller's validation on every
+    attempt. Carries the last parsed (invalid) result so the caller can salvage what is usable."""
+
+    def __init__(self, message: str, last_result: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.last_result = last_result
+
+
 class SimulationConfigGenerator:
     """
     模拟配置智能生成器
-    
+
     使用LLM分析模拟需求、文档内容、图谱实体信息，
     自动生成最佳的模拟参数配置
     
@@ -226,6 +238,9 @@ class SimulationConfigGenerator:
     ENTITY_SUMMARY_LENGTH = 300          # 实体摘要
     AGENT_SUMMARY_LENGTH = 300           # Agent配置中的实体摘要
     ENTITIES_PER_TYPE_DISPLAY = 20       # 每类实体显示数量
+    # 事件配置降级重试：输出被截断/结构不符时，再要一次更短的（最多这么多条初始帖子）
+    EVENT_CONFIG_FALLBACK_MAX_POSTS = 8
+    EVENT_CONFIG_FALLBACK_MAX_CHARS = 200
     
     def __init__(
         self,
@@ -281,7 +296,8 @@ class SimulationConfigGenerator:
             SimulationParameters: 完整的模拟参数
         """
         logger.info(f"开始智能生成模拟配置: simulation_id={simulation_id}, 实体数={len(entities)}")
-        
+        self.event_config_warnings: List[str] = []
+
         # 计算总步骤数
         batches = split_batches(len(entities), self.agents_per_batch)
         num_batches = len(batches)
@@ -387,10 +403,13 @@ class SimulationConfigGenerator:
             reddit_config=reddit_config,
             llm_model=self.model_name,
             llm_base_url=self.base_url,
-            generation_reasoning=" | ".join(reasoning_parts)
+            generation_reasoning=" | ".join(reasoning_parts + list(self.event_config_warnings)),
+            warnings=list(self.event_config_warnings),
         )
-        
+
         logger.info(f"模拟配置生成完成: {len(params.agent_configs)} 个Agent配置")
+        for w in params.warnings:
+            logger.warning(w)
         
         return params
     
@@ -447,13 +466,32 @@ class SimulationConfigGenerator:
         
         return "\n".join(lines)
     
-    def _call_llm_with_retry(self, prompt: str, system_prompt: str) -> Dict[str, Any]:
-        """带重试的LLM调用，包含JSON修复逻辑"""
+    def _call_llm_with_retry(
+        self,
+        prompt: str,
+        system_prompt: str,
+        validate: Optional[Callable[[Dict[str, Any]], bool]] = None,
+    ) -> Dict[str, Any]:
+        """带重试的LLM调用，包含JSON修复逻辑
+
+        ``validate(parsed)``（可选）：对解析/修复后的 JSON 做结构校验。json_object 只保证
+        语法；输出被截断后经 _fix_truncated_json / _try_fix_config_json "修复"出来的结构
+        可能是错的（2026-09-10：initial_posts 里出现裸字符串，下游 .get() 崩溃）。校验不
+        通过视为本次尝试失败，进入下一次（更低温度）重试；全部失败则抛
+        LLMOutputShapeError，并附带最后一次解析结果供调用方降级使用。
+        """
         import re
-        
+
         max_attempts = 3
         last_error = None
-        
+        last_invalid: Optional[Dict[str, Any]] = None
+
+        def _accept(parsed):
+            if validate is None or validate(parsed):
+                return True
+            logger.warning(f"LLM返回结构不符 (attempt {attempt+1})，重试")
+            return False
+
         for attempt in range(max_attempts):
             try:
                 response = create_chat_completion(
@@ -467,35 +505,68 @@ class SimulationConfigGenerator:
                     temperature=0.7 - (attempt * 0.1),  # 每次重试降低温度
                     # 不设置max_tokens，让LLM自由发挥
                 )
-                
+
                 content = extract_chat_completion_text(response)
                 finish_reason = response.choices[0].finish_reason
-                
+
                 # 检查是否被截断
                 if finish_reason == 'length':
                     logger.warning(f"LLM输出被截断 (attempt {attempt+1})")
                     content = self._fix_truncated_json(content)
-                
+
                 # 尝试解析JSON
                 try:
-                    return json.loads(content)
+                    parsed = json.loads(content)
                 except json.JSONDecodeError as e:
                     logger.warning(f"JSON解析失败 (attempt {attempt+1}): {str(e)[:80]}")
-                    
+
                     # 尝试修复JSON
-                    fixed = self._try_fix_config_json(content)
-                    if fixed:
-                        return fixed
-                    
-                    last_error = e
-                    
+                    parsed = self._try_fix_config_json(content)
+                    if not parsed:
+                        last_error = e
+                        continue
+
+                if _accept(parsed):
+                    return parsed
+                last_invalid = parsed
+                last_error = LLMOutputShapeError("LLM返回结构不符", parsed)
+
             except Exception as e:
                 logger.warning(f"LLM调用失败 (attempt {attempt+1}): {str(e)[:80]}")
                 last_error = e
                 import time
                 time.sleep(2 * (attempt + 1))
-        
+
+        if last_invalid is not None:
+            raise LLMOutputShapeError("LLM返回结构不符（已重试）", last_invalid)
         raise last_error or Exception("LLM调用失败")
+
+    # ------------------------------------------------------------------ 事件配置结构校验
+    @staticmethod
+    def _is_well_formed_post(post: Any) -> bool:
+        return (isinstance(post, dict)
+                and isinstance(post.get("content"), str)
+                and post.get("content").strip() != ""
+                and (post.get("poster_type") is None or isinstance(post.get("poster_type"), str)))
+
+    @classmethod
+    def _event_config_is_well_formed(cls, result: Any) -> bool:
+        """initial_posts 必须是列表，且每一项都是带非空 content 的对象。"""
+        if not isinstance(result, dict):
+            return False
+        posts = result.get("initial_posts")
+        if not isinstance(posts, list):
+            return False
+        return all(cls._is_well_formed_post(p) for p in posts)
+
+    @classmethod
+    def _salvage_initial_posts(cls, result: Any):
+        """保留结构正确的初始帖子，返回 (kept, dropped_count)。"""
+        if not isinstance(result, dict) or not isinstance(result.get("initial_posts"), list):
+            return [], 0
+        posts = result["initial_posts"]
+        kept = [p for p in posts if cls._is_well_formed_post(p)]
+        return kept, len(posts) - len(kept)
     
     def _fix_truncated_json(self, content: str) -> str:
         """修复被截断的JSON"""
@@ -722,16 +793,55 @@ class SimulationConfigGenerator:
         system_prompt = "你是舆论分析专家。返回纯JSON格式。注意 poster_type 必须精确匹配可用实体类型。"
         system_prompt = f"{system_prompt}\n\n{get_language_instruction()}\nIMPORTANT: The 'poster_type' field value MUST be in English PascalCase exactly matching the available entity types. Only 'content', 'narrative_direction', 'hot_topics' and 'reasoning' fields should use the specified language."
 
+        validate = self._event_config_is_well_formed
+        warnings = getattr(self, "event_config_warnings", None)
+        if warnings is None:
+            warnings = self.event_config_warnings = []
+
+        # 第一梯队：正常生成，结构校验不过则（更低温度）重试，最多 3 次
+        last_invalid: Optional[Dict[str, Any]] = None
         try:
-            return self._call_llm_with_retry(prompt, system_prompt)
+            return self._call_llm_with_retry(prompt, system_prompt, validate=validate)
+        except LLMOutputShapeError as e:
+            last_invalid = e.last_result
+            logger.warning(f"事件配置结构不符，改用短输出重试: {e}")
         except Exception as e:
-            logger.warning(f"事件配置LLM生成失败: {e}, 使用默认配置")
-            return {
-                "hot_topics": [],
-                "narrative_direction": "",
-                "initial_posts": [],
-                "reasoning": "使用默认配置"
-            }
+            logger.warning(f"事件配置LLM生成失败: {e}，改用短输出重试")
+
+        # 第二梯队：明确限制输出长度再要一次（截断的根因是输出超过 token 上限）
+        short_prompt = (
+            f"{prompt}\n\n**输出长度限制**: initial_posts 最多 {self.EVENT_CONFIG_FALLBACK_MAX_POSTS} 条，"
+            f"每条 content 不超过 {self.EVENT_CONFIG_FALLBACK_MAX_CHARS} 字；hot_topics 最多 5 个；"
+            f"narrative_direction 与 reasoning 各不超过 200 字。"
+        )
+        try:
+            result = self._call_llm_with_retry(short_prompt, system_prompt, validate=validate)
+            warnings.append("EVENT_CONFIG_SHORTENED: initial posts regenerated with a length cap "
+                            "after a truncated/malformed first pass")
+            return result
+        except LLMOutputShapeError as e:
+            last_invalid = e.last_result or last_invalid
+            logger.warning(f"事件配置短输出重试仍不符: {e}")
+        except Exception as e:
+            logger.warning(f"事件配置短输出重试失败: {e}")
+
+        # 第三梯队：只保留结构正确的帖子，丢弃其余，并明确标记降级（从不静默）
+        kept, dropped = self._salvage_initial_posts(last_invalid)
+        base = last_invalid if isinstance(last_invalid, dict) else {}
+        if kept:
+            warnings.append(f"EVENT_CONFIG_DEGRADED: kept {len(kept)} well-formed initial posts, "
+                            f"dropped {dropped} malformed after all retries")
+        else:
+            warnings.append("EVENT_CONFIG_EMPTY: no well-formed initial posts after all retries; "
+                            "simulation starts without seed posts")
+        for w in warnings:
+            logger.warning(w)
+        return {
+            "hot_topics": base.get("hot_topics", []) if isinstance(base.get("hot_topics"), list) else [],
+            "narrative_direction": base.get("narrative_direction", "") if isinstance(base.get("narrative_direction"), str) else "",
+            "initial_posts": kept,
+            "reasoning": "降级：初始帖子部分/全部丢弃（见 warnings）",
+        }
     
     def _parse_event_config(self, result: Dict[str, Any]) -> EventConfig:
         """解析事件配置结果"""
@@ -780,7 +890,11 @@ class SimulationConfigGenerator:
         
         updated_posts = []
         for post in event_config.initial_posts:
-            poster_type = post.get("poster_type", "").lower()
+            if not isinstance(post, dict):
+                # 兜底：结构错误的帖子在 _generate_event_config 已被过滤；这里绝不再因此崩溃
+                logger.warning(f"跳过结构错误的初始帖子: {str(post)[:80]!r}")
+                continue
+            poster_type = str(post.get("poster_type") or "").lower()
             content = post.get("content", "")
             
             # 尝试找到匹配的 agent
