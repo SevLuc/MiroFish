@@ -23,6 +23,10 @@ from ..utils.logger import get_logger
 from ..utils.locale import get_language_instruction, t
 from ..utils.openai_chat_compat import create_chat_completion, extract_chat_completion_text
 from .zep_entity_reader import EntityNode, ZepEntityReader
+from .config_batches import (
+    resolve_agents_per_batch, resolve_config_parallel_count, resolve_config_llm_timeout,
+    split_batches, run_batches,
+)
 
 logger = get_logger('mirofish.simulation_config')
 
@@ -235,12 +239,18 @@ class SimulationConfigGenerator:
         
         if not self.api_key:
             raise ValueError("LLM_API_KEY 未配置")
-        
+
+        # 分批生成 Agent 配置的并行度 / 批大小 / 单次请求超时（见 config_batches.py）：
+        # 每批是一次独立的、受 LLM 延迟支配的调用，串行执行让该阶段耗时 = 批数 x 单次延迟。
+        self.agents_per_batch = resolve_agents_per_batch()
+        self.config_llm_timeout = resolve_config_llm_timeout()
+
         self.client = OpenAI(
             api_key=self.api_key,
-            base_url=self.base_url
+            base_url=self.base_url,
+            timeout=self.config_llm_timeout,   # 单次请求超时：一次卡住的调用只损失这么多秒（SDK 会自动重试）
         )
-    
+
     def generate_config(
         self,
         simulation_id: str,
@@ -273,7 +283,9 @@ class SimulationConfigGenerator:
         logger.info(f"开始智能生成模拟配置: simulation_id={simulation_id}, 实体数={len(entities)}")
         
         # 计算总步骤数
-        num_batches = math.ceil(len(entities) / self.AGENTS_PER_BATCH)
+        batches = split_batches(len(entities), self.agents_per_batch)
+        num_batches = len(batches)
+        parallel_count = resolve_config_parallel_count(num_batches=num_batches)
         total_steps = 3 + num_batches  # 时间配置 + 事件配置 + N批Agent + 平台配置
         current_step = 0
         
@@ -306,26 +318,29 @@ class SimulationConfigGenerator:
         event_config = self._parse_event_config(event_config_result)
         reasoning_parts.append(f"{t('progress.eventConfigLabel')}: {event_config_result.get('reasoning', t('common.success'))}")
         
-        # ========== 步骤3-N: 分批生成Agent配置 ==========
-        all_agent_configs = []
-        for batch_idx in range(num_batches):
-            start_idx = batch_idx * self.AGENTS_PER_BATCH
-            end_idx = min(start_idx + self.AGENTS_PER_BATCH, len(entities))
-            batch_entities = entities[start_idx:end_idx]
-            
-            report_progress(
-                3 + batch_idx,
-                t('progress.generatingAgentConfig', start=start_idx + 1, end=end_idx, total=len(entities))
-            )
-            
-            batch_configs = self._generate_agent_configs_batch(
+        # ========== 步骤3-N: 分批生成Agent配置（并行） ==========
+        # 每批只包含自己的实体，agent_id 由批偏移量在调用前确定，批与批之间无共享状态，
+        # 因此可以同时发起并按批顺序拼接（config_batches.run_batches）。
+        logger.info(f"Agent配置分批生成: {len(entities)} 个实体, 每批 {self.agents_per_batch}, "
+                    f"共 {num_batches} 批, 并行 {parallel_count}, 单次请求超时 {self.config_llm_timeout:.0f}s")
+
+        def _run_batch(batch_idx, start_idx, end_idx):
+            return self._generate_agent_configs_batch(
                 context=context,
-                entities=batch_entities,
+                entities=entities[start_idx:end_idx],
                 start_idx=start_idx,
                 simulation_requirement=simulation_requirement
             )
-            all_agent_configs.extend(batch_configs)
-        
+
+        def _on_batch_done(completed, batch_idx):
+            start_idx, end_idx = batches[batch_idx]
+            report_progress(
+                2 + completed,
+                t('progress.generatingAgentConfig', start=start_idx + 1, end=end_idx, total=len(entities))
+            )
+
+        all_agent_configs = run_batches(_run_batch, batches, parallel_count, on_done=_on_batch_done)
+
         reasoning_parts.append(t('progress.agentConfigResult', count=len(all_agent_configs)))
         
         # ========== 为初始帖子分配发布者 Agent ==========
