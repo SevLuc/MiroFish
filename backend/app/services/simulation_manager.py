@@ -76,7 +76,9 @@ class SimulationState:
     
     # 错误信息
     error: Optional[str] = None
-    
+    # 准备阶段的降级警告（如 EVENT_CONFIG_DEGRADED）；空 = 正常
+    prepare_warnings: List[str] = field(default_factory=list)
+
     def to_dict(self) -> Dict[str, Any]:
         """完整状态字典（内部使用）"""
         return {
@@ -98,8 +100,9 @@ class SimulationState:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "error": self.error,
+            "prepare_warnings": list(self.prepare_warnings),
         }
-    
+
     def get_default_platform(self) -> str:
         """根据启用状态返回默认平台"""
         if self.enable_twitter and self.enable_reddit:
@@ -122,6 +125,7 @@ class SimulationState:
             "profiles_generated": self.profiles_generated,
             "config_generated": self.config_generated,
             "error": self.error,
+            "prepare_warnings": list(self.prepare_warnings),
         }
 
 
@@ -200,8 +204,9 @@ class SimulationManager:
             created_at=data.get("created_at", datetime.now().isoformat()),
             updated_at=data.get("updated_at", datetime.now().isoformat()),
             error=data.get("error"),
+            prepare_warnings=list(data.get("prepare_warnings") or []),
         )
-        
+
         self._simulations[simulation_id] = state
         return state
     
@@ -446,7 +451,8 @@ class SimulationManager:
             
             state.config_generated = True
             state.config_reasoning = sim_params.generation_reasoning
-            
+            state.prepare_warnings = list(getattr(sim_params, "warnings", []) or [])
+
             if progress_callback:
                 progress_callback(
                     "generating_config", 100,
