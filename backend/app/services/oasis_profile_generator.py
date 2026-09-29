@@ -10,12 +10,19 @@ OASIS Agent Profile生成器
 
 import json
 import random
+import threading
 import time
+from contextlib import contextmanager
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
 
+import httpx
 from openai import OpenAI
+try:
+    from openai import DefaultHttpxClient
+except ImportError:  # older SDKs: plain httpx client, same keyword arguments
+    DefaultHttpxClient = httpx.Client
 from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.locale import get_language_instruction, get_locale, set_locale, t
@@ -28,8 +35,35 @@ from ..utils.zep import (
 )
 from .zep_entity_reader import EntityNode, ZepEntityReader
 from .graph_backend import use_graphiti, get_graphiti_backend
+from .profile_llm import (
+    PROFILE_LLM_MAX_ATTEMPTS,
+    backoff_delay,
+    call_with_deadline,
+    classify_failure,
+    degradation_warnings,
+    resolve_profile_llm_timeout,
+)
 
 logger = get_logger('mirofish.oasis_profile')
+
+# Which persona call the current thread is making, so the HTTP client's response hook can say
+# whose headers just arrived (see OasisProfileGenerator._log_first_byte).
+_call_context = threading.local()
+
+
+@contextmanager
+def profile_llm_call_context(entity: str, attempt: int):
+    """Tag the current thread with the persona LLM call it is about to send."""
+    _call_context.current = {"entity": entity, "attempt": attempt, "started": time.monotonic()}
+    try:
+        yield
+    finally:
+        _call_context.current = None
+
+
+def _quoted(name: str) -> str:
+    """Entity names carry spaces and punctuation; quote them so a log line stays parseable."""
+    return json.dumps(name, ensure_ascii=False)
 
 
 def _coerce_to_str(value: Any) -> str:
@@ -255,12 +289,15 @@ class OasisProfileGenerator:
         
         if not self.api_key:
             raise ValueError("LLM_API_KEY 未配置")
-        
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url
-        )
-        
+
+        # 单次人设 LLM 调用的墙钟上限（PROFILE_LLM_TIMEOUT_SECONDS，默认 300 s）——见 profile_llm.py。
+        self.profile_llm_timeout = resolve_profile_llm_timeout()
+        self.client = self._build_client()
+
+        # 回退到规则人设的实体（entity / entity_type / node_degree / reason），经 prepare_warnings 上报。
+        self.profile_degradations: List[Dict[str, Any]] = []
+        self._degradation_lock = threading.Lock()
+
         # Zep客户端用于检索丰富上下文
         self.zep_api_key = zep_api_key or Config.ZEP_API_KEY
         self.zep_client = None
@@ -271,7 +308,82 @@ class OasisProfileGenerator:
                 self.zep_client = get_zep_client(self.zep_api_key)
             except Exception as e:
                 logger.warning(f"Zep客户端初始化失败: {e}")
-    
+
+    def _build_client(self) -> OpenAI:
+        """The persona LLM client: a socket timeout equal to the wall-clock cap, and no SDK
+        retries (the SDK default is two silent ones, which would multiply the cap by three
+        behind the retry loop in ``_generate_profile_with_llm``).
+
+        The socket timeout is the layer that gives a *silent* wedged thread back; the wall-clock
+        deadline in ``call_with_deadline`` is the layer that also bounds a connection the
+        provider keeps busy. Read is set to the full cap, not lower: on a non-streaming request
+        the socket is legitimately quiet for as long as the model is generating."""
+        cap = self.profile_llm_timeout
+        edge = min(10.0, cap)
+        timeout = httpx.Timeout(connect=edge, read=cap, write=edge, pool=edge)
+        return OpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            timeout=timeout,
+            max_retries=0,
+            http_client=DefaultHttpxClient(
+                timeout=timeout,
+                event_hooks={"response": [self._log_first_byte]},
+            ),
+        )
+
+    def _log_first_byte(self, response) -> None:
+        """HTTP response hook: the headers of a persona call arrived (the body is not read yet).
+        Once this line is in the log, a later silence is a slow or dripping body; without it the
+        provider never answered at all."""
+        call = getattr(_call_context, "current", None)
+        if not call:
+            return
+        logger.info(
+            "PROFILE_LLM first_byte entity=%s attempt=%d elapsed=%.1fs status=%s",
+            _quoted(call["entity"]), call["attempt"],
+            time.monotonic() - call["started"], response.status_code,
+        )
+
+    @staticmethod
+    def _node_degree(entity: EntityNode) -> int:
+        """Edges touching the entity in the graph: the centrality proxy reported with a degradation."""
+        return len(entity.related_edges or [])
+
+    @staticmethod
+    def _degradation_reason(error: Optional[BaseException]) -> str:
+        reason = classify_failure(error) if error is not None else "error"
+        if reason == "error" and error is not None:
+            return f"error:{type(error).__name__}"
+        return reason
+
+    def _record_degradation(
+        self,
+        entity_name: str,
+        entity_type: str,
+        node_degree: Optional[int],
+        reason: str
+    ) -> None:
+        """An entity ended up on the rule-based persona: say so loudly and keep the record."""
+        record = {
+            "entity": entity_name,
+            "entity_type": entity_type,
+            "node_degree": node_degree,
+            "reason": reason,
+        }
+        with self._degradation_lock:
+            self.profile_degradations.append(record)
+        logger.error(
+            "PROFILE_DEGRADED entity=%s entity_type=%s node_degree=%s reason=%s",
+            _quoted(entity_name), entity_type, node_degree, reason,
+        )
+
+    def degradation_warnings(self, total: Optional[int] = None) -> List[str]:
+        """``prepare_warnings`` lines for this run's degraded personas (empty = none degraded)."""
+        with self._degradation_lock:
+            records = sorted(self.profile_degradations, key=lambda r: str(r.get("entity")))
+        return degradation_warnings(records, total if total is not None else len(records))
+
     def generate_profile_from_entity(
         self, 
         entity: EntityNode, 
@@ -305,7 +417,8 @@ class OasisProfileGenerator:
                 entity_type=entity_type,
                 entity_summary=entity.summary,
                 entity_attributes=entity.attributes,
-                context=context
+                context=context,
+                node_degree=self._node_degree(entity)
             )
         else:
             # 使用规则生成基础人设
@@ -597,16 +710,22 @@ class OasisProfileGenerator:
         entity_type: str,
         entity_summary: str,
         entity_attributes: Dict[str, Any],
-        context: str
+        context: str,
+        node_degree: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         使用LLM生成非常详细的人设
-        
+
         根据实体类型区分：
         - 个人实体：生成具体的人物设定
         - 群体/机构实体：生成代表性账号设定
+
+        Never raises and never waits on a call for longer than the cap: every attempt is bounded
+        by ``PROFILE_LLM_TIMEOUT_SECONDS`` of wall clock, a failed attempt is re-sent (backoff, and
+        a fresh client after a transport failure), and when the attempts run out the entity gets
+        the rule-based persona and a ``PROFILE_DEGRADED`` record instead of sinking the cluster.
         """
-        
+
         is_individual = self._is_individual_entity(entity_type)
         
         if is_individual:
@@ -619,63 +738,112 @@ class OasisProfileGenerator:
             )
 
         # 尝试多次生成，直到成功或达到最大重试次数
-        max_attempts = 3
+        max_attempts = PROFILE_LLM_MAX_ATTEMPTS
         last_error = None
-        
+        client = self.client
+        messages = [
+            {"role": "system", "content": self._get_system_prompt(is_individual)},
+            {"role": "user", "content": prompt}
+        ]
+
         for attempt in range(max_attempts):
+            started = time.monotonic()
+            outcome = "error"
+            logger.info(
+                "PROFILE_LLM start entity=%s attempt=%d/%d timeout=%gs",
+                _quoted(entity_name), attempt + 1, max_attempts, self.profile_llm_timeout,
+            )
             try:
-                response = create_chat_completion(
-                    self.client,
-                    model=self.model_name,
-                    messages=[
-                        {"role": "system", "content": self._get_system_prompt(is_individual)},
-                        {"role": "user", "content": prompt}
-                    ],
-                    response_format={"type": "json_object"},
+                response = self._send_persona_request(
+                    client,
+                    entity_name=entity_name,
+                    attempt=attempt,
+                    messages=messages,
                     temperature=0.7 - (attempt * 0.1),  # 每次重试降低温度
-                    # 不设置max_tokens，让LLM自由发挥
                 )
-                
+
                 content = extract_chat_completion_text(response)
-                
+
                 # 检查是否被截断（finish_reason不是'stop'）
                 finish_reason = response.choices[0].finish_reason
                 if finish_reason == 'length':
                     logger.warning(f"LLM输出被截断 (attempt {attempt+1}), 尝试修复...")
                     content = self._fix_truncated_json(content)
-                
+
                 # 尝试解析JSON
                 try:
                     result = json.loads(content)
-                    
+
                     # 验证必需字段
                     if "bio" not in result or not result["bio"]:
                         result["bio"] = entity_summary[:200] if entity_summary else f"{entity_type}: {entity_name}"
                     if "persona" not in result or not result["persona"]:
                         result["persona"] = entity_summary or f"{entity_name}是一个{entity_type}。"
-                    
+
+                    outcome = "ok"
                     return result
-                    
+
                 except json.JSONDecodeError as je:
                     logger.warning(f"JSON解析失败 (attempt {attempt+1}): {str(je)[:80]}")
-                    
+
                     # 尝试修复JSON
                     result = self._try_fix_json(content, entity_name, entity_type, entity_summary)
                     if result.get("_fixed"):
                         del result["_fixed"]
+                        outcome = "ok"
                         return result
-                    
+
                     last_error = je
-                    
+                    outcome = "bad_json"
+
             except Exception as e:
+                # 超时 / 连接错误 / 提供方报错：都重试（此前一次不返回的调用根本到不了这里）
                 logger.warning(f"LLM调用失败 (attempt {attempt+1}): {str(e)[:80]}")
                 last_error = e
-                import time
-                time.sleep(1 * (attempt + 1))  # 指数退避
-        
+                outcome = classify_failure(e)
+            finally:
+                logger.info(
+                    "PROFILE_LLM end entity=%s attempt=%d/%d elapsed=%.1fs outcome=%s",
+                    _quoted(entity_name), attempt + 1, max_attempts,
+                    time.monotonic() - started, outcome,
+                )
+
+            if attempt + 1 < max_attempts and outcome != "bad_json":
+                time.sleep(backoff_delay(attempt))  # 指数退避 + 抖动（约 1 s、约 4 s）
+                if outcome in ("timeout", "connection"):
+                    # 超时的连接可能已损坏（或仍被放弃的调用占用）：重试用全新的客户端和连接
+                    client = self._build_client()
+
         logger.warning(f"LLM生成人设失败（{max_attempts}次尝试）: {last_error}, 使用规则生成")
+        self._record_degradation(
+            entity_name, entity_type, node_degree, self._degradation_reason(last_error)
+        )
         return self._generate_profile_rule_based(
             entity_name, entity_type, entity_summary, entity_attributes
+        )
+
+    def _send_persona_request(
+        self,
+        client: OpenAI,
+        entity_name: str,
+        attempt: int,
+        messages: List[Dict[str, str]],
+        temperature: float
+    ) -> Any:
+        """One persona LLM request, bounded by the wall-clock cap (raises ``ProfileLLMTimeout``)."""
+        def send():
+            with profile_llm_call_context(entity=entity_name, attempt=attempt + 1):
+                return create_chat_completion(
+                    client,
+                    model=self.model_name,
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                    temperature=temperature,
+                    # 不设置max_tokens，让LLM自由发挥
+                )
+
+        return call_with_deadline(
+            send, self.profile_llm_timeout, name=f"profile-llm-{entity_name}-{attempt + 1}"
         )
     
     def _fix_truncated_json(self, content: str) -> str:
@@ -982,7 +1150,11 @@ class OasisProfileGenerator:
         profiles = [None] * total  # 预分配列表保持顺序
         completed_count = [0]  # 使用列表以便在闭包中修改
         lock = Lock()
-        
+
+        # 每次运行重新统计降级（degradation_warnings 只反映本次运行）
+        with self._degradation_lock:
+            self.profile_degradations = []
+
         # 实时写入文件的辅助函数
         def save_profiles_realtime():
             """实时保存已生成的 profiles 到文件"""
@@ -1036,6 +1208,10 @@ class OasisProfileGenerator:
                 
             except Exception as e:
                 logger.error(f"生成实体 {entity.name} 的人设失败: {str(e)}")
+                self._record_degradation(
+                    entity.name, entity_type, self._node_degree(entity),
+                    self._degradation_reason(e)
+                )
                 # 创建一个基础profile
                 fallback_profile = OasisAgentProfile(
                     user_id=idx,
@@ -1091,6 +1267,10 @@ class OasisProfileGenerator:
                         
                 except Exception as e:
                     logger.error(f"处理实体 {entity.name} 时发生异常: {str(e)}")
+                    self._record_degradation(
+                        entity.name, entity_type, self._node_degree(entity),
+                        self._degradation_reason(e)
+                    )
                     with lock:
                         completed_count[0] += 1
                     profiles[idx] = OasisAgentProfile(

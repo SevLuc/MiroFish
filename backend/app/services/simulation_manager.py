@@ -369,8 +369,13 @@ class SimulationManager:
                 output_platform=realtime_platform  # 输出格式
             )
             
+            # 人设降级（PROFILE_DEGRADED）：某实体的 LLM 调用超时/失败后退回规则人设。只上报、不判定——
+            # 是否构成实质性降级由调用方根据 entity / node_degree 决定。
+            profile_warnings = list(generator.degradation_warnings(total=len(profiles)))
+
             state.profiles_count = len(profiles)
             state.profiles_generated = len(profiles) > 0
+            state.prepare_warnings = list(profile_warnings)
             self._save_simulation_state(state)
             
             # 保存Profile文件（注意：Twitter使用CSV格式，Reddit使用JSON格式）
@@ -451,7 +456,8 @@ class SimulationManager:
             
             state.config_generated = True
             state.config_reasoning = sim_params.generation_reasoning
-            state.prepare_warnings = list(getattr(sim_params, "warnings", []) or [])
+            # 人设阶段的警告在前，配置阶段的在后（此前这里的赋值会覆盖掉前者）
+            state.prepare_warnings = profile_warnings + list(getattr(sim_params, "warnings", []) or [])
 
             if progress_callback:
                 progress_callback(
