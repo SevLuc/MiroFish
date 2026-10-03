@@ -7,7 +7,12 @@ gracefully adapting request parameters for GPT-5 family models.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Dict, List, Optional
+
+from .logger import get_logger
+
+logger = get_logger('mirofish.llm')
 
 
 def is_gpt5_family(model: Optional[str]) -> bool:
@@ -54,7 +59,30 @@ def create_chat_completion(
         else:
             kwargs["max_tokens"] = max_tokens
 
-    return client.chat.completions.create(**kwargs)
+    started = time.monotonic()
+    response = client.chat.completions.create(**kwargs)
+    _log_completed_call(model, response, time.monotonic() - started)
+    return response
+
+
+def _log_completed_call(model: str, response: Any, elapsed: float) -> None:
+    """One ``LLM_CALL`` line per completed request: which provider served it (OpenRouter names
+    it on the response), how it ended, and its token usage. A request that never returns logs
+    nothing here; its trace is the caller's own timeout line."""
+    usage = getattr(response, "usage", None)
+    choices = getattr(response, "choices", None) or [None]
+    details = getattr(usage, "completion_tokens_details", None)
+    logger.info(
+        "LLM_CALL model=%s provider=%s finish=%s prompt_tokens=%s completion_tokens=%s "
+        "reasoning_tokens=%s elapsed=%.1fs",
+        model,
+        getattr(response, "provider", None),
+        getattr(choices[0], "finish_reason", None),
+        getattr(usage, "prompt_tokens", None),
+        getattr(usage, "completion_tokens", None),
+        getattr(details, "reasoning_tokens", None),
+        elapsed,
+    )
 
 
 def extract_chat_completion_text(response: Any) -> str:

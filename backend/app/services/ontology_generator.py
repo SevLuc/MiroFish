@@ -5,9 +5,12 @@
 
 import json
 import logging
+import os
 import re
+import time
 from typing import Dict, Any, List, Optional
-from ..utils.llm_client import LLMClient
+from ..utils.llm_client import LLMClient, LLMResponseError
+from .profile_llm import ProfileLLMTimeout, backoff_delay, call_with_deadline
 from ..utils.locale import get_language_instruction
 from ..utils.file_parser import split_text_into_chunks
 from ..utils.ontology import (
@@ -17,6 +20,23 @@ from ..utils.ontology import (
 )
 
 logger = logging.getLogger(__name__)
+
+# The ontology request has no output cap (see generate()), so one runaway generation is only
+# bounded by wall clock. On 2026-10-02 a single request ran 45 minutes to finish_reason=length
+# and its one retry returned malformed JSON, which failed the whole task. 480 s clears all but
+# one healthy call seen in 25 days of runs (p95 427 s, max 792 s); three attempts stay under
+# 30 minutes in total. Tune with ONTOLOGY_LLM_TIMEOUT_SECONDS.
+DEFAULT_ONTOLOGY_LLM_TIMEOUT_SECONDS = 480.0
+ONTOLOGY_LLM_MAX_ATTEMPTS = 3
+
+
+def _ontology_llm_timeout() -> float:
+    """``ONTOLOGY_LLM_TIMEOUT_SECONDS`` env, garbage or <= 0 -> default."""
+    try:
+        value = float(os.environ.get("ONTOLOGY_LLM_TIMEOUT_SECONDS") or 0)
+    except ValueError:
+        value = 0.0
+    return value if value > 0 else DEFAULT_ONTOLOGY_LLM_TIMEOUT_SECONDS
 
 
 def _to_pascal_case(name: str) -> str:
@@ -232,21 +252,49 @@ class OntologyGenerator:
         ]
         
         # 调用LLM
-        result = self.llm_client.chat_json(
-            messages=messages,
-            temperature=0.3,
-            # Structured ontology responses can exceed 4096 completion tokens,
-            # especially when a compatible provider counts hidden reasoning in
-            # the same budget. Let the provider use its model-specific limit.
-            max_tokens=None,
-            max_attempts=2,
-        )
-        
+        result = self._chat_json_bounded(messages)
+
         # 验证和后处理
         result = self._validate_and_process(result)
-        
+
         return result
-    
+
+    def _chat_json_bounded(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
+        """Ask for the ontology up to ``ONTOLOGY_LLM_MAX_ATTEMPTS`` times, abandoning each
+        request after the wall-clock cap. A timeout and an unusable response are retried;
+        provider errors propagate unchanged. When the attempts run out the failure is an
+        ``LLMResponseError``, so the API still answers 502."""
+        timeout = _ontology_llm_timeout()
+        for attempt in range(1, ONTOLOGY_LLM_MAX_ATTEMPTS + 1):
+            try:
+                return call_with_deadline(
+                    lambda: self.llm_client.chat_json(
+                        messages=messages,
+                        temperature=0.3,
+                        # Structured ontology responses can exceed 4096 completion tokens,
+                        # especially when a compatible provider counts hidden reasoning in
+                        # the same budget. Let the provider use its model-specific limit.
+                        max_tokens=None,
+                        # One request per call: the retry lives here, where it is bounded.
+                        max_attempts=1,
+                    ),
+                    timeout,
+                    name="ontology-llm",
+                )
+            except (ProfileLLMTimeout, LLMResponseError) as error:
+                logger.warning(
+                    "ONTOLOGY_LLM attempt=%d/%d failed: %s",
+                    attempt, ONTOLOGY_LLM_MAX_ATTEMPTS, error,
+                )
+                if attempt == ONTOLOGY_LLM_MAX_ATTEMPTS:
+                    if isinstance(error, LLMResponseError):
+                        raise
+                    raise LLMResponseError(
+                        f"LLM returned no ontology within {timeout:g}s "
+                        f"({ONTOLOGY_LLM_MAX_ATTEMPTS} attempts)"
+                    ) from error
+                time.sleep(backoff_delay(attempt - 1))
+
     # 传给 LLM 的文本最大长度（5万字）
     MAX_TEXT_LENGTH_FOR_LLM = 50000
     LONG_TEXT_CHUNK_SIZE = 8000
