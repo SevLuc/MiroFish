@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.utils import openai_chat_compat
 from app.utils.openai_chat_compat import (
     create_chat_completion,
     extract_chat_completion_text,
@@ -88,6 +89,40 @@ def test_provider_error_is_propagated_without_guessing_or_retrying():
 
     assert captured.value is provider_error
     assert len(recorder.calls) == 1
+
+
+def test_completed_call_is_logged_with_provider_and_token_usage(monkeypatch):
+    lines = []
+    monkeypatch.setattr(
+        openai_chat_compat.logger, "info", lambda msg, *args: lines.append(msg % args)
+    )
+    response = SimpleNamespace(
+        provider="DeepInfra",
+        choices=[SimpleNamespace(finish_reason="length")],
+        usage=SimpleNamespace(
+            prompt_tokens=1200,
+            completion_tokens=65536,
+            completion_tokens_details=SimpleNamespace(reasoning_tokens=60000),
+        ),
+    )
+
+    create_chat_completion(
+        client_for(CompletionRecorder(result=response)),
+        model="deepseek/deepseek-v4-flash",
+        messages=[],
+    )
+
+    assert len(lines) == 1
+    assert lines[0].startswith("LLM_CALL ")
+    for part in (
+        "model=deepseek/deepseek-v4-flash",
+        "provider=DeepInfra",
+        "finish=length",
+        "prompt_tokens=1200",
+        "completion_tokens=65536",
+        "reasoning_tokens=60000",
+    ):
+        assert part in lines[0]
 
 
 @pytest.mark.parametrize(
