@@ -52,7 +52,8 @@ def test_env_knobs_reach_the_generator_and_the_client(monkeypatch):
     gen = scg.SimulationConfigGenerator(api_key="k", base_url="http://localhost:1", model_name="m")
     assert gen.agents_per_batch == 10
     assert gen.config_llm_timeout == 90.0
-    assert float(gen.client.timeout) == 90.0
+    assert gen.client.timeout.read == 90.0        # the cap is also the socket read timeout
+    assert gen.client.max_retries == 0             # the deadline loop owns retries
 
 
 def test_defaults_when_env_unset(monkeypatch):

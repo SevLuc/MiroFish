@@ -12,10 +12,12 @@
 
 import json
 import math
+import time
 from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 
+import httpx
 from openai import OpenAI
 
 from ..config import Config
@@ -25,8 +27,15 @@ from ..utils.openai_chat_compat import create_chat_completion, extract_chat_comp
 from .zep_entity_reader import EntityNode, ZepEntityReader
 from .config_batches import (
     resolve_agents_per_batch, resolve_config_parallel_count, resolve_config_llm_timeout,
+    resolve_config_reasoning_effort, reasoning_extra_body,
     split_batches, run_batches,
 )
+from .profile_llm import call_with_deadline, classify_failure
+
+#: ``prepare_warnings`` markers for config-generation calls that fell back to the rule-based
+#: config after every bounded attempt failed (same shape as ``PROFILE_DEGRADED*``, fork #15).
+WARNING_CONFIG_DEGRADED = "CONFIG_DEGRADED"
+WARNING_CONFIG_DEGRADED_SUMMARY = "CONFIG_DEGRADED_SUMMARY"
 
 logger = get_logger('mirofish.simulation_config')
 
@@ -255,16 +264,69 @@ class SimulationConfigGenerator:
         if not self.api_key:
             raise ValueError("LLM_API_KEY 未配置")
 
-        # 分批生成 Agent 配置的并行度 / 批大小 / 单次请求超时（见 config_batches.py）：
+        # 分批生成 Agent 配置的并行度 / 批大小 / 单次调用墙钟上限（见 config_batches.py）：
         # 每批是一次独立的、受 LLM 延迟支配的调用，串行执行让该阶段耗时 = 批数 x 单次延迟。
         self.agents_per_batch = resolve_agents_per_batch()
         self.config_llm_timeout = resolve_config_llm_timeout()
+        # OpenRouter reasoning preference for these calls (default: off — see config_batches.py).
+        self.config_reasoning_effort = resolve_config_reasoning_effort()
+        # 退回规则配置的调用（stage / reason / agents），经 SimulationParameters.warnings 上报。
+        self.config_degradations: List[Dict[str, Any]] = []
 
-        self.client = OpenAI(
+        self.client = self._build_client()
+
+    def _build_client(self) -> OpenAI:
+        """The config-generation LLM client: a socket read timeout equal to the wall-clock cap and
+        no SDK retries (the retry loop in ``_call_llm_with_retry`` owns retries).
+
+        The read timeout alone never bounded these calls: the gateway keeps the connection fed, so
+        a 60 s "timeout" let 500 to 2 281 s calls complete (2026-10-07 / 10-08). The wall-clock
+        deadline in ``call_with_deadline`` is what bounds an attempt; the socket timeout is the
+        second layer that eventually frees a silent, abandoned thread. SDK retries are off because
+        the deadline abandons the thread, and a hidden re-send would just keep it busy longer."""
+        cap = self.config_llm_timeout
+        edge = min(30.0, cap)
+        timeout = httpx.Timeout(connect=edge, read=cap, write=edge, pool=edge)
+        return OpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
-            timeout=self.config_llm_timeout,   # 单次请求超时：一次卡住的调用只损失这么多秒（SDK 会自动重试）
+            timeout=timeout,
+            max_retries=0,
         )
+
+    @staticmethod
+    def _degradation_reason(error: Optional[BaseException]) -> str:
+        if error is None:
+            return "error"
+        if isinstance(error, LLMOutputShapeError):
+            return "bad_shape"
+        kind = classify_failure(error)
+        return kind if kind != "error" else f"error:{type(error).__name__}"
+
+    def _record_degradation(self, stage: str, error: Optional[BaseException], **detail) -> None:
+        record = {"stage": stage, "reason": self._degradation_reason(error), **detail}
+        self.config_degradations.append(record)
+        logger.error("CONFIG_DEGRADED %s", json.dumps(record, ensure_ascii=False))
+
+    def degradation_warnings(self, total_agents: int) -> List[str]:
+        """``prepare_warnings`` lines for config calls that ended on the rule-based fallback: one
+        ``CONFIG_DEGRADED: {json}`` per call plus a ``CONFIG_DEGRADED_SUMMARY`` with how many agents
+        run on default dials. Empty when nothing degraded, so an empty list still means clean."""
+        records = list(self.config_degradations)
+        if not records:
+            return []
+        degraded_agents = sum(int(r.get("agents") or 0) for r in records if r.get("stage") == "agent_config")
+        total_agents = max(int(total_agents or 0), degraded_agents)
+        summary = {
+            "degraded_agents": degraded_agents,
+            "total_agents": total_agents,
+            "fraction": round(degraded_agents / total_agents, 4) if total_agents else 0.0,
+            "time_config_defaulted": any(r.get("stage") == "time_config" for r in records),
+            "calls": len(records),
+        }
+        lines = [f"{WARNING_CONFIG_DEGRADED}: {json.dumps(r, ensure_ascii=False)}" for r in records]
+        lines.append(f"{WARNING_CONFIG_DEGRADED_SUMMARY}: {json.dumps(summary)}")
+        return lines
 
     def generate_config(
         self,
@@ -297,6 +359,7 @@ class SimulationConfigGenerator:
         """
         logger.info(f"开始智能生成模拟配置: simulation_id={simulation_id}, 实体数={len(entities)}")
         self.event_config_warnings: List[str] = []
+        self.config_degradations = []
 
         # 计算总步骤数
         batches = split_batches(len(entities), self.agents_per_batch)
@@ -338,7 +401,8 @@ class SimulationConfigGenerator:
         # 每批只包含自己的实体，agent_id 由批偏移量在调用前确定，批与批之间无共享状态，
         # 因此可以同时发起并按批顺序拼接（config_batches.run_batches）。
         logger.info(f"Agent配置分批生成: {len(entities)} 个实体, 每批 {self.agents_per_batch}, "
-                    f"共 {num_batches} 批, 并行 {parallel_count}, 单次请求超时 {self.config_llm_timeout:.0f}s")
+                    f"共 {num_batches} 批, 并行 {parallel_count}, 单次调用墙钟上限 {self.config_llm_timeout:.0f}s, "
+                    f"reasoning={self.config_reasoning_effort or 'provider-default'}")
 
         def _run_batch(batch_idx, start_idx, end_idx):
             return self._generate_agent_configs_batch(
@@ -404,7 +468,8 @@ class SimulationConfigGenerator:
             llm_model=self.model_name,
             llm_base_url=self.base_url,
             generation_reasoning=" | ".join(reasoning_parts + list(self.event_config_warnings)),
-            warnings=list(self.event_config_warnings),
+            # 事件配置的警告在前，配置调用降级（CONFIG_DEGRADED*）在后；都进入 prepare_warnings。
+            warnings=list(self.event_config_warnings) + self.degradation_warnings(len(entities)),
         )
 
         logger.info(f"模拟配置生成完成: {len(params.agent_configs)} 个Agent配置")
@@ -471,6 +536,7 @@ class SimulationConfigGenerator:
         prompt: str,
         system_prompt: str,
         validate: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        stage: str = "config",
     ) -> Dict[str, Any]:
         """带重试的LLM调用，包含JSON修复逻辑
 
@@ -479,12 +545,18 @@ class SimulationConfigGenerator:
         可能是错的（2026-09-10：initial_posts 里出现裸字符串，下游 .get() 崩溃）。校验不
         通过视为本次尝试失败，进入下一次（更低温度）重试；全部失败则抛
         LLMOutputShapeError，并附带最后一次解析结果供调用方降级使用。
+
+        每次尝试受 ``CONFIG_LLM_TIMEOUT_SECONDS`` 的墙钟上限约束（``call_with_deadline``，自调用
+        开始计时）：超时的调用被放弃（线程继续到 socket 超时或返回为止，结果丢弃），计为一次失败
+        尝试。2026-10-08 之前这里只有 socket 空闲超时，网关持续喂数据时它永不触发，一次 10～37 分钟
+        的调用就能拖垮整个 prepare。
         """
         import re
 
         max_attempts = 3
         last_error = None
         last_invalid: Optional[Dict[str, Any]] = None
+        extra_body = reasoning_extra_body(self.config_reasoning_effort)
 
         def _accept(parsed):
             if validate is None or validate(parsed):
@@ -493,17 +565,28 @@ class SimulationConfigGenerator:
             return False
 
         for attempt in range(max_attempts):
+            started = time.monotonic()
+            outcome = "ok"
             try:
-                response = create_chat_completion(
-                    self.client,
-                    model=self.model_name,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt}
-                    ],
-                    response_format={"type": "json_object"},
-                    temperature=0.7 - (attempt * 0.1),  # 每次重试降低温度
-                    # 不设置max_tokens，让LLM自由发挥
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ]
+                temperature = 0.7 - (attempt * 0.1)  # 每次重试降低温度
+
+                def _send(messages=messages, temperature=temperature):
+                    return create_chat_completion(
+                        self.client,
+                        model=self.model_name,
+                        messages=messages,
+                        response_format={"type": "json_object"},
+                        temperature=temperature,
+                        # 不设置max_tokens，让LLM自由发挥
+                        extra_body=extra_body,
+                    )
+
+                response = call_with_deadline(
+                    _send, self.config_llm_timeout, name=f"config-llm-{stage}-{attempt + 1}"
                 )
 
                 content = extract_chat_completion_text(response)
@@ -524,18 +607,25 @@ class SimulationConfigGenerator:
                     parsed = self._try_fix_config_json(content)
                     if not parsed:
                         last_error = e
+                        outcome = "bad_json"
                         continue
 
                 if _accept(parsed):
                     return parsed
                 last_invalid = parsed
                 last_error = LLMOutputShapeError("LLM返回结构不符", parsed)
+                outcome = "bad_shape"
 
             except Exception as e:
+                outcome = classify_failure(e)
                 logger.warning(f"LLM调用失败 (attempt {attempt+1}): {str(e)[:80]}")
                 last_error = e
-                import time
                 time.sleep(2 * (attempt + 1))
+            finally:
+                logger.info(
+                    "CONFIG_LLM end stage=%s attempt=%d/%d elapsed=%.1fs outcome=%s",
+                    stage, attempt + 1, max_attempts, time.monotonic() - started, outcome,
+                )
 
         if last_invalid is not None:
             raise LLMOutputShapeError("LLM返回结构不符（已重试）", last_invalid)
@@ -677,9 +767,10 @@ class SimulationConfigGenerator:
         system_prompt = f"{system_prompt}\n\n{get_language_instruction()}"
 
         try:
-            return self._call_llm_with_retry(prompt, system_prompt)
+            return self._call_llm_with_retry(prompt, system_prompt, stage="time_config")
         except Exception as e:
             logger.warning(f"时间配置LLM生成失败: {e}, 使用默认配置")
+            self._record_degradation("time_config", e)
             return self._get_default_time_config(num_entities)
     
     def _get_default_time_config(self, num_entities: int) -> Dict[str, Any]:
@@ -801,7 +892,8 @@ class SimulationConfigGenerator:
         # 第一梯队：正常生成，结构校验不过则（更低温度）重试，最多 3 次
         last_invalid: Optional[Dict[str, Any]] = None
         try:
-            return self._call_llm_with_retry(prompt, system_prompt, validate=validate)
+            return self._call_llm_with_retry(prompt, system_prompt, validate=validate,
+                                             stage="event_config")
         except LLMOutputShapeError as e:
             last_invalid = e.last_result
             logger.warning(f"事件配置结构不符，改用短输出重试: {e}")
@@ -815,7 +907,8 @@ class SimulationConfigGenerator:
             f"narrative_direction 与 reasoning 各不超过 200 字。"
         )
         try:
-            result = self._call_llm_with_retry(short_prompt, system_prompt, validate=validate)
+            result = self._call_llm_with_retry(short_prompt, system_prompt, validate=validate,
+                                               stage="event_config_short")
             warnings.append("EVENT_CONFIG_SHORTENED: initial posts regenerated with a length cap "
                             "after a truncated/malformed first pass")
             return result
@@ -1001,10 +1094,12 @@ class SimulationConfigGenerator:
         system_prompt = f"{system_prompt}\n\n{get_language_instruction()}\nIMPORTANT: The 'stance' field value MUST be one of the English strings: 'supportive', 'opposing', 'neutral', 'observer'. All JSON field names and numeric values must remain unchanged. Only natural language text fields should use the specified language."
 
         try:
-            result = self._call_llm_with_retry(prompt, system_prompt)
+            result = self._call_llm_with_retry(prompt, system_prompt, stage="agent_config")
             llm_configs = {cfg["agent_id"]: cfg for cfg in result.get("agent_configs", [])}
         except Exception as e:
             logger.warning(f"Agent配置批次LLM生成失败: {e}, 使用规则生成")
+            self._record_degradation("agent_config", e, batch_start=start_idx, agents=len(entities),
+                                     entities=[e_.name for e_ in entities])
             llm_configs = {}
         
         # 构建AgentActivityConfig对象
