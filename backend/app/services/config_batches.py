@@ -15,8 +15,18 @@ This module is pure (no LLM / Flask / Zep imports) so the scheduling is unit-tes
   batch at once (the natural maximum: more workers than batches does nothing); ``N`` caps the
   in-flight calls, the knob to turn down if the provider starts returning 429s.
 * :func:`resolve_config_llm_timeout` — ``CONFIG_LLM_TIMEOUT_SECONDS`` env (default 180 s): the
-  per-request HTTP timeout handed to the OpenAI client, so one stalled call costs seconds, not
-  the 4 to 23 minute hangs seen in production. The SDK retries a timed-out request on its own.
+  wall-clock cap of ONE config-generation LLM attempt (time config, event config, each agent
+  batch), measured from the start of the call, and also the HTTP read timeout handed to the OpenAI
+  client. Until 2026-10-08 it was only the read timeout, which never fires while the gateway keeps
+  the connection fed: calls of 500 to 2 281 s completed through a 60 s "timeout", and one such call
+  per cluster held the whole prepare stage until its 3600 s watchdog (all three clusters, 10-08).
+* :func:`resolve_config_reasoning_effort` — ``CONFIG_LLM_REASONING_EFFORT`` env (default ``none``):
+  the OpenRouter ``reasoning.effort`` sent with every config-generation call. These calls map an
+  entity type plus a one-line summary onto a handful of behaviour dials and return ~1 K tokens of
+  JSON; the slow answers on 10-08 were 8 K to 47 K reasoning tokens for exactly that, because the
+  provider OpenRouter picked turns thinking on by default. ``none`` disables it where the provider
+  supports the switch; ``provider`` (or ``default``) sends nothing and leaves it to the provider;
+  ``low`` / ``medium`` / ``high`` / ``minimal`` pass through.
 * :func:`run_batches` — the executor.
 """
 import concurrent.futures
@@ -25,6 +35,11 @@ import os
 
 DEFAULT_AGENTS_PER_BATCH = 15
 DEFAULT_CONFIG_LLM_TIMEOUT_SECONDS = 180.0
+DEFAULT_CONFIG_LLM_REASONING_EFFORT = "none"
+#: Values that mean "send no reasoning preference; the provider decides" (the pre-2026-10-08 shape).
+_REASONING_PROVIDER_DEFAULT = ("provider", "default", "unset")
+_REASONING_OFF = ("none", "off", "0", "false", "disabled")
+_REASONING_LEVELS = ("minimal", "low", "medium", "high")
 
 
 def _env(env):
@@ -75,6 +90,30 @@ def resolve_config_llm_timeout(env=None):
     except ValueError:
         return DEFAULT_CONFIG_LLM_TIMEOUT_SECONDS
     return value if value > 0 else DEFAULT_CONFIG_LLM_TIMEOUT_SECONDS
+
+
+def resolve_config_reasoning_effort(env=None):
+    """OpenRouter ``reasoning.effort`` for the config-generation calls, or ``None`` to send nothing.
+
+    ``CONFIG_LLM_REASONING_EFFORT`` env: unset/``none``/``off`` -> ``"none"`` (reasoning disabled,
+    the default); ``provider``/``default`` -> ``None`` (no preference sent); a known effort level
+    passes through; anything else -> the default."""
+    raw = (_env(env).get("CONFIG_LLM_REASONING_EFFORT") or "").strip().lower()
+    if not raw or raw in _REASONING_OFF:
+        return "none"
+    if raw in _REASONING_PROVIDER_DEFAULT:
+        return None
+    if raw in _REASONING_LEVELS:
+        return raw
+    return DEFAULT_CONFIG_LLM_REASONING_EFFORT
+
+
+def reasoning_extra_body(effort):
+    """The OpenAI-SDK ``extra_body`` carrying an OpenRouter reasoning preference, or ``None``.
+    OpenRouter forwards ``reasoning`` only to providers that support it; others ignore it."""
+    if not effort:
+        return None
+    return {"reasoning": {"effort": effort}}
 
 
 def split_batches(n_items, per_batch):

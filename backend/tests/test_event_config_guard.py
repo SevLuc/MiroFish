@@ -41,7 +41,7 @@ def _gen(monkeypatch, responses):
     it = iter(responses)
     last = responses[-1]
 
-    def fake_create(client, *, model, messages, temperature=None, max_tokens=None, response_format=None):
+    def fake_create(client, *, model, messages, temperature=None, max_tokens=None, response_format=None, **kwargs):
         calls["prompts"].append(messages[1]["content"])
         nonlocal last
         try:
