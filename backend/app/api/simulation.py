@@ -729,8 +729,22 @@ def get_prepare_status():
         
         task_id = data.get('task_id')
         simulation_id = data.get('simulation_id')
-        
-        # 如果提供了simulation_id，先检查是否已准备完成
+
+        # 有 task_id 且任务仍在本进程内：以任务为准（含 result.prepare_warnings —
+        # PROFILE_DEGRADED* / EVENT_CONFIG_* / CONFIG_DEGRADED*，见 SimulationState.to_simple_dict）。
+        # 2026-10-09 之前下面的"已准备完成"分支先于任务查询：人设/配置文件一落盘就返回 ready 且不带
+        # result，调用方从未拿到 prepare_warnings（worker 134 份 result.json 无一携带告警）。
+        task_manager = TaskManager()
+        task = task_manager.get_task(task_id) if task_id else None
+        if task:
+            task_dict = task.to_dict()
+            task_dict["already_prepared"] = False
+            return jsonify({
+                "success": True,
+                "data": task_dict
+            })
+
+        # 没有任务（或 task_id 未知，例如进程重启后）：按文件判断是否已准备完成
         if simulation_id:
             is_prepared, prepare_info = _check_simulation_prepared(simulation_id)
             if is_prepared:
@@ -738,14 +752,15 @@ def get_prepare_status():
                     "success": True,
                     "data": {
                         "simulation_id": simulation_id,
+                        "task_id": task_id,
                         "status": "ready",
                         "progress": 100,
-                        "message": t('api.alreadyPrepared'),
+                        "message": t('api.taskCompletedPrepared') if task_id else t('api.alreadyPrepared'),
                         "already_prepared": True,
                         "prepare_info": prepare_info
                     }
                 })
-        
+
         # 如果没有task_id，返回错误
         if not task_id:
             if simulation_id:
@@ -764,41 +779,13 @@ def get_prepare_status():
                 "success": False,
                 "error": t('api.requireTaskOrSimId')
             }), 400
-        
-        task_manager = TaskManager()
-        task = task_manager.get_task(task_id)
-        
-        if not task:
-            # 任务不存在，但如果有simulation_id，检查是否已准备完成
-            if simulation_id:
-                is_prepared, prepare_info = _check_simulation_prepared(simulation_id)
-                if is_prepared:
-                    return jsonify({
-                        "success": True,
-                        "data": {
-                            "simulation_id": simulation_id,
-                            "task_id": task_id,
-                            "status": "ready",
-                            "progress": 100,
-                            "message": t('api.taskCompletedPrepared'),
-                            "already_prepared": True,
-                            "prepare_info": prepare_info
-                        }
-                    })
-            
-            return jsonify({
-                "success": False,
-                "error": t('api.taskNotFound', id=task_id)
-            }), 404
-        
-        task_dict = task.to_dict()
-        task_dict["already_prepared"] = False
-        
+
+        # task_id 未知且文件也未就绪
         return jsonify({
-            "success": True,
-            "data": task_dict
-        })
-        
+            "success": False,
+            "error": t('api.taskNotFound', id=task_id)
+        }), 404
+
     except Exception as e:
         logger.error(f"查询任务状态失败: {str(e)}")
         return jsonify({
